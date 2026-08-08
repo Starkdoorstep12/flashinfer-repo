@@ -161,7 +161,7 @@ def indexer_kernel(
 
 
    k_page_ptr = k_index_cache_fp8 + (
-       page_index * page_size * head_dim_with_scale * kv_cache_num_heads
+       page_index * page_size * head_dim_with_scale
    )
 
 

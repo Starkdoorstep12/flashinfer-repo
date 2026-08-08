@@ -1,11 +1,12 @@
 import triton
-import triton.language as tl
+import triton.language as t1
 import torch 
 import math
 
 # ── Local kernel imports ──────────────────────────────────────────────────────
 from .indexer_kernel import run_indexer_and_topk   # TopK indexer + selector
 
+@triton.jit
 def dsa_fwd_kernel(
     Q_NOPE, Q_PE, CKV_CACHE, KPE_CACHE, SPARSE_INDICES, OUTPUT, LSE,
     sm_scale,
