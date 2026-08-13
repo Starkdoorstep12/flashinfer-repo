@@ -1,0 +1,13 @@
+
+NOTICE: Existing SQLite export found: /home/vedant.tejas/dsa_kernel_profile.sqlite
+        It is assumed file was previously exported from: /home/vedant.tejas/dsa_kernel_profile.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/home/vedant.tejas/dsa_kernel_profile.sqlite] with [/opt/nvidia/nsight-systems/2025.1.3/host-linux-x64/reports/cuda_gpu_mem_time_sum.py]... 
+
+ ** CUDA GPU MemOps Summary (by Time) (cuda_gpu_mem_time_sum):
+
+ Time (%)  Total Time (ns)  Count  Avg (ns)  Med (ns)  Min (ns)  Max (ns)  StdDev (ns)           Operation          
+ --------  ---------------  -----  --------  --------  --------  --------  -----------  ----------------------------
+    100.0              928      1     928.0     928.0       928       928          0.0  [CUDA memcpy Host-to-Device]
+

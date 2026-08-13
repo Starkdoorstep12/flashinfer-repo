@@ -441,7 +441,7 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale):
     topk = sparse_indices.shape[-1]
 
     # Check constants
-    assert num_qo_heads == 64
+    assert num_qo_heads == 16
     assert head_dim_ckv == 512
     assert head_dim_kpe == 64
     assert page_size == 64

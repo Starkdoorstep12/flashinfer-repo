@@ -1,8 +1,9 @@
 [solution]
 name = "TheRealDoers_V1"      # Solution name
-definition = "sparse_attention"          # Track: fused_moe | sparse_attention | gated_delta_net
+definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"          # Track: fused_moe | sparse_attention | gated_delta_net
 author = "TheRealDoers"              # Team/author name
 
 [build]
 language = "triton"               # triton | cuda
-entry_point = "kernel.py::run_sparse_attention_pipeline"  # Kernel function name
+entry_point = "kernel.py::kernel"  # Kernel function name
+destination_passing_style = false
