@@ -565,3 +565,235 @@ def kernel_splitk(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, 
     )
 
     return output, lse
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Split-K v2: fixes bottleneck 3 (dsa_reduce_kernel scaling linearly with
+# SPLIT_K due to a sequential t1.static_range loop). Splits the reduction
+# into three phases:
+#   Phase A: compute final (m, l) per token — cheap, vectorized hardware
+#            reduction over the small [SPLIT_K, BLOCK_H] tile.
+#   Phase B: once m_final/l_final are known, each split's rescale factor
+#            is independent — accumulate the (large) weighted acc tensor
+#            in PARALLEL across splits via atomic adds, instead of a
+#            sequential per-split loop in one program.
+#   Phase C: finalize (divide by l_final) — cheap, one program per token.
+# ═══════════════════════════════════════════════════════════════════════════
+
+@triton.jit
+def dsa_reduce_phaseA_kernel(
+    PARTIAL_M, PARTIAL_L, M_FINAL, L_FINAL,
+    stride_pm_tok, stride_pm_split, stride_pm_h,
+    stride_pl_tok, stride_pl_split, stride_pl_h,
+    stride_mf_tok, stride_mf_h,
+    stride_lf_tok, stride_lf_h,
+    SPLIT_K: t1.constexpr,
+    BLOCK_H: t1.constexpr,
+):
+    # One program per token. Loads the whole [SPLIT_K, BLOCK_H] tile of
+    # partial (m, l) at once and reduces with hardware max/sum instead of
+    # a sequential Python-level loop — SPLIT_K only affects tile size here,
+    # not instruction count, since t1.max/t1.sum are real parallel reductions.
+    tok_id = t1.program_id(0)
+
+    offs_s = t1.arange(0, SPLIT_K)
+    offs_h = t1.arange(0, BLOCK_H)
+
+    pm_ptrs = PARTIAL_M + tok_id * stride_pm_tok + offs_s[:, None] * stride_pm_split + offs_h[None, :] * stride_pm_h
+    m_split = t1.load(pm_ptrs)  # [SPLIT_K, BLOCK_H]
+
+    pl_ptrs = PARTIAL_L + tok_id * stride_pl_tok + offs_s[:, None] * stride_pl_split + offs_h[None, :] * stride_pl_h
+    l_split = t1.load(pl_ptrs)  # [SPLIT_K, BLOCK_H]
+
+    m_final = t1.max(m_split, axis=0)  # [BLOCK_H]
+
+    m_final_row = m_final[None, :]
+    finite_mask = m_final_row != -float("inf")
+    alpha = t1.where(finite_mask, t1.exp(m_split - m_final_row), 0.0)  # [SPLIT_K, BLOCK_H]
+
+    l_final = t1.sum(alpha * l_split, axis=0)  # [BLOCK_H]
+
+    mf_ptrs = M_FINAL + tok_id * stride_mf_tok + offs_h * stride_mf_h
+    t1.store(mf_ptrs, m_final)
+
+    lf_ptrs = L_FINAL + tok_id * stride_lf_tok + offs_h * stride_lf_h
+    t1.store(lf_ptrs, l_final)
+
+
+@triton.jit
+def dsa_reduce_phaseB_kernel(
+    PARTIAL_ACC, PARTIAL_M, M_FINAL, ACC_FINAL,
+    stride_pacc_tok, stride_pacc_split, stride_pacc_h, stride_pacc_d,
+    stride_pm_tok, stride_pm_split, stride_pm_h,
+    stride_mf_tok, stride_mf_h,
+    stride_af_tok, stride_af_h, stride_af_d,
+    BLOCK_D_CKV: t1.constexpr,
+    BLOCK_H: t1.constexpr,
+):
+    # One program per (token, split) — same grid shape as the forward
+    # kernel, genuinely parallel across splits. Each program independently
+    # rescales its own partial acc by alpha_split (now computable directly
+    # since m_final is already known from Phase A) and atomically adds it
+    # into a shared per-token accumulator.
+    tok_id = t1.program_id(0)
+    split_id = t1.program_id(1)
+
+    offs_h = t1.arange(0, BLOCK_H)
+    offs_d = t1.arange(0, BLOCK_D_CKV)
+
+    pm_ptrs = PARTIAL_M + tok_id * stride_pm_tok + split_id * stride_pm_split + offs_h * stride_pm_h
+    m_split = t1.load(pm_ptrs)  # [BLOCK_H]
+
+    mf_ptrs = M_FINAL + tok_id * stride_mf_tok + offs_h * stride_mf_h
+    m_final = t1.load(mf_ptrs)  # [BLOCK_H]
+
+    finite_mask = m_final != -float("inf")
+    alpha = t1.where(finite_mask, t1.exp(m_split - m_final), 0.0)  # [BLOCK_H]
+
+    pacc_ptrs = (PARTIAL_ACC + tok_id * stride_pacc_tok + split_id * stride_pacc_split
+                 + offs_h[:, None] * stride_pacc_h + offs_d[None, :] * stride_pacc_d)
+    acc_split = t1.load(pacc_ptrs)  # [BLOCK_H, BLOCK_D_CKV]
+
+    contribution = alpha[:, None] * acc_split
+
+    af_ptrs = (ACC_FINAL + tok_id * stride_af_tok
+               + offs_h[:, None] * stride_af_h + offs_d[None, :] * stride_af_d)
+    t1.atomic_add(af_ptrs, contribution)
+
+
+@triton.jit
+def dsa_reduce_phaseC_kernel(
+    ACC_FINAL, M_FINAL, L_FINAL, OUTPUT, LSE,
+    stride_af_tok, stride_af_h, stride_af_d,
+    stride_mf_tok, stride_mf_h,
+    stride_lf_tok, stride_lf_h,
+    stride_out_tok, stride_out_h, stride_out_d,
+    stride_lse_tok, stride_lse_h,
+    BLOCK_D_CKV: t1.constexpr,
+    BLOCK_H: t1.constexpr,
+):
+    # One program per token. Cheap final divide + LSE computation, same as
+    # the tail end of the original dsa_fwd_kernel / dsa_reduce_kernel.
+    tok_id = t1.program_id(0)
+
+    offs_h = t1.arange(0, BLOCK_H)
+    offs_d = t1.arange(0, BLOCK_D_CKV)
+
+    mf_ptrs = M_FINAL + tok_id * stride_mf_tok + offs_h * stride_mf_h
+    m_final = t1.load(mf_ptrs)
+
+    lf_ptrs = L_FINAL + tok_id * stride_lf_tok + offs_h * stride_lf_h
+    l_final = t1.load(lf_ptrs)
+
+    af_ptrs = (ACC_FINAL + tok_id * stride_af_tok
+               + offs_h[:, None] * stride_af_h + offs_d[None, :] * stride_af_d)
+    acc_final = t1.load(af_ptrs)
+
+    m_finite = m_final != -float("inf")
+    m_finite_col = m_final[:, None] != -float("inf")
+
+    acc_out = t1.where(m_finite_col, acc_final / l_final[:, None], 0.0)
+
+    out_ptrs = OUTPUT + tok_id * stride_out_tok + offs_h[:, None] * stride_out_h + offs_d[None, :] * stride_out_d
+    t1.store(out_ptrs, acc_out.to(t1.bfloat16))
+
+    math_log2 = 0.6931471805599453
+    lse = (m_final + t1.log(l_final)) / math_log2
+    lse_out = t1.where(m_finite, lse, -float("inf"))
+    lse_ptrs = LSE + tok_id * stride_lse_tok + offs_h * stride_lse_h
+    t1.store(lse_ptrs, lse_out)
+
+
+def kernel_splitk_v2(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, SPLIT_K=16):
+    """
+    Same as kernel_splitk() but with a 3-phase parallel reduction instead of
+    the sequential t1.static_range(SPLIT_K) merge, fixing the linear-in-
+    SPLIT_K scaling of the reduce step (see docs/SPLITK_OPTIMIZATION.md,
+    bottleneck 3).
+    """
+    num_tokens, num_qo_heads, head_dim_ckv = q_nope.shape
+    num_pages, page_size, _ = ckv_cache.shape
+    head_dim_kpe = q_pe.shape[-1]
+    topk = sparse_indices.shape[-1]
+
+    assert num_qo_heads == 16
+    assert head_dim_ckv == 512
+    assert head_dim_kpe == 64
+    assert page_size == 64
+    assert topk == 2048
+    assert topk % SPLIT_K == 0, f"topk={topk} must be divisible by SPLIT_K={SPLIT_K}"
+
+    device = q_nope.device
+
+    output = torch.zeros((num_tokens, num_qo_heads, head_dim_ckv), dtype=torch.bfloat16, device=device)
+    lse = torch.full((num_tokens, num_qo_heads), fill_value=-float("inf"), dtype=torch.float32, device=device)
+
+    partial_acc = torch.zeros((num_tokens, SPLIT_K, num_qo_heads, head_dim_ckv), dtype=torch.float32, device=device)
+    partial_m = torch.full((num_tokens, SPLIT_K, num_qo_heads), -float("inf"), dtype=torch.float32, device=device)
+    partial_l = torch.zeros((num_tokens, SPLIT_K, num_qo_heads), dtype=torch.float32, device=device)
+
+    chunk_size = topk // SPLIT_K
+    BLOCK_N = min(64, max(16, chunk_size // 2))
+
+    # ── Forward pass: same kernel as kernel_splitk() ──────────────────────
+    grid_splitk = (num_tokens, SPLIT_K)
+    dsa_fwd_kernel_splitk[grid_splitk](
+        q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices,
+        partial_acc, partial_m, partial_l,
+        sm_scale,
+        q_nope.stride(0), q_nope.stride(1), q_nope.stride(2),
+        q_pe.stride(0), q_pe.stride(1), q_pe.stride(2),
+        ckv_cache.stride(0), ckv_cache.stride(1), ckv_cache.stride(2),
+        kpe_cache.stride(0), kpe_cache.stride(1), kpe_cache.stride(2),
+        sparse_indices.stride(0), sparse_indices.stride(1),
+        partial_acc.stride(0), partial_acc.stride(1), partial_acc.stride(2), partial_acc.stride(3),
+        partial_m.stride(0), partial_m.stride(1), partial_m.stride(2),
+        partial_l.stride(0), partial_l.stride(1), partial_l.stride(2),
+        page_size=page_size, topk=topk,
+        SPLIT_K=SPLIT_K,
+        BLOCK_N=BLOCK_N,
+        BLOCK_D_CKV=head_dim_ckv,
+        BLOCK_D_KPE=head_dim_kpe,
+        BLOCK_H=num_qo_heads,
+    )
+
+    # ── Phase A: compute final (m, l) per token ────────────────────────────
+    m_final = torch.full((num_tokens, num_qo_heads), -float("inf"), dtype=torch.float32, device=device)
+    l_final = torch.zeros((num_tokens, num_qo_heads), dtype=torch.float32, device=device)
+
+    dsa_reduce_phaseA_kernel[(num_tokens,)](
+        partial_m, partial_l, m_final, l_final,
+        partial_m.stride(0), partial_m.stride(1), partial_m.stride(2),
+        partial_l.stride(0), partial_l.stride(1), partial_l.stride(2),
+        m_final.stride(0), m_final.stride(1),
+        l_final.stride(0), l_final.stride(1),
+        SPLIT_K=SPLIT_K,
+        BLOCK_H=num_qo_heads,
+    )
+
+    # ── Phase B: parallel weighted accumulation via atomics ───────────────
+    acc_final = torch.zeros((num_tokens, num_qo_heads, head_dim_ckv), dtype=torch.float32, device=device)
+
+    dsa_reduce_phaseB_kernel[(num_tokens, SPLIT_K)](
+        partial_acc, partial_m, m_final, acc_final,
+        partial_acc.stride(0), partial_acc.stride(1), partial_acc.stride(2), partial_acc.stride(3),
+        partial_m.stride(0), partial_m.stride(1), partial_m.stride(2),
+        m_final.stride(0), m_final.stride(1),
+        acc_final.stride(0), acc_final.stride(1), acc_final.stride(2),
+        BLOCK_D_CKV=head_dim_ckv,
+        BLOCK_H=num_qo_heads,
+    )
+
+    # ── Phase C: finalize ───────────────────────────────────────────────────
+    dsa_reduce_phaseC_kernel[(num_tokens,)](
+        acc_final, m_final, l_final, output, lse,
+        acc_final.stride(0), acc_final.stride(1), acc_final.stride(2),
+        m_final.stride(0), m_final.stride(1),
+        l_final.stride(0), l_final.stride(1),
+        output.stride(0), output.stride(1), output.stride(2),
+        lse.stride(0), lse.stride(1),
+        BLOCK_D_CKV=head_dim_ckv,
+        BLOCK_H=num_qo_heads,
+    )
+
+    return output, lse

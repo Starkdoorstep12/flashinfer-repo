@@ -206,3 +206,99 @@ continuing to improve.
 | 1 | Grid too small (1 block, 1/142 SMs) | **Fixed** | Split-K forward kernel |
 | 2 | Per-block shared memory caps occupancy at ~8.3% | Open | Reduce shared-mem footprint (tiling, lower precision) |
 | 3 | Reduce kernel scales linearly with SPLIT_K, caps useful SPLIT_K at ~16 | Open | Tree reduction or parallel merge |
+
+## Attempted fix for bottleneck 3: parallel 3-phase reduction (kernel_splitk_v2)
+
+To fix bottleneck 3 (sequential reduce kernel scaling linearly with
+`SPLIT_K`), implemented `kernel_splitk_v2()` with a 3-phase parallel
+reduction, replacing the single sequential `dsa_reduce_kernel`:
+
+- **Phase A** (`dsa_reduce_phaseA_kernel`): one program per token, computes
+  final `(m, l)` using vectorized hardware reduction (`t1.max`/`t1.sum`
+  over a `[SPLIT_K, BLOCK_H]` tile) instead of a sequential loop.
+- **Phase B** (`dsa_reduce_phaseB_kernel`): one program per **(token,
+  split)** — same grid shape as the forward kernel, genuinely parallel.
+  Each program independently computes its own rescale factor (now possible
+  since `m_final` is already known from Phase A) and atomically adds its
+  contribution into a shared per-token accumulator.
+- **Phase C** (`dsa_reduce_phaseC_kernel`): one program per token, cheap
+  final divide + LSE computation.
+
+### Correctness
+
+Verified exact match (`max_abs_err=0.000000`) against `kernel()` across
+`SPLIT_K = 2, 4, 8, 16, 32, 64, 128` — same strength of result as v1,
+despite introducing atomic adds (fp32 atomics on Ada apparently did not
+introduce visible reordering error at this scale).
+
+### GPU kernel time: genuinely improved
+
+| SPLIT_K | v1 total (fwd + sequential reduce) | v2 total (fwd + 3 reduce phases) |
+|---|---|---|
+| 16 | 21.5 μs | 33.9 μs* |
+| 64 | 60.3 μs | 38.4 μs |
+| 128 | 116.3 μs | 48.1 μs |
+
+*Note: v2 has a higher fixed cost at low SPLIT_K (3 extra kernel launches'
+worth of per-launch GPU-side overhead), but scales far better — v1's
+sequential reduce nearly doubles with each SPLIT_K doubling; v2's Phase B
+grows only ~1.9x across an 8x increase in SPLIT_K (21.0 → 29.1 → 39.8 μs).
+At SPLIT_K=128, v2's total GPU kernel time is less than half of v1's.
+
+### Wall-clock latency: WORSE across the board
+
+| SPLIT_K | v1 wall-clock | v2 wall-clock |
+|---|---|---|
+| 2 | 69.7 μs | 114.5 μs |
+| 16 | 68.3 μs | 112.0 μs |
+| 64 | 70.8 μs | 113.7 μs |
+| 128 | 127.7 μs | 115.2 μs |
+
+**v2 is slower than v1 everywhere except SPLIT_K=128** (where it's 115 vs
+128 μs — the one point where v1's linear reduce-kernel blowup is bad
+enough to lose). Everywhere else, v1 wins by a wide margin (~35-65 μs
+worse for v2).
+
+### Why: launch-overhead cost exceeded the compute savings
+
+v1 launches 2 kernels per call (forward + reduce). v2 launches 4 (forward +
+3 reduce phases). At these very short per-call durations (tens of
+microseconds), fixed CPU-side kernel-launch dispatch cost dominates total
+latency more than the GPU-side compute time itself — this is the same
+launch-overhead effect first seen when comparing the original single-block
+kernel to v1 (see "Performance results" above), now compounded by v2
+having twice as many launches as v1.
+
+**Conclusion: bottleneck 3 (sequential reduce-kernel scaling) is real and
+v2 genuinely fixes it in GPU-compute terms, but it isn't actually on the
+practical path.** The linear scaling only becomes a serious problem at
+`SPLIT_K ≥ 64`, and that operating point was never attractive anyway once
+launch overhead is accounted for (v1's own sweep showed the practical
+useful range is `SPLIT_K ≈ 8-16`, well below where bottleneck 3 bites
+hard). Solving bottleneck 3 with more kernel launches trades a problem that
+matters at an operating point you wouldn't use anyway, for a cost (launch
+overhead) that hurts at every operating point.
+
+**Current recommendation: keep `kernel_splitk` (v1) with `SPLIT_K ≈ 16` as
+the practical configuration.** `kernel_splitk_v2` is kept in the codebase
+as a correctness-verified alternative and a documented example of a fix
+that is correct and measurably better on one axis (GPU compute time) while
+being worse on the axis that actually matters (end-to-end latency) — a
+useful cautionary result for the eventual writeup.
+
+### Open direction: fusion instead of more parallelism
+
+A more promising angle than v2's added-parallelism approach may be
+**reducing launch count** while keeping some of the parallel-reduction
+benefit — e.g. fusing Phase A and Phase C into the forward kernel's own
+launch via a persistent-kernel or single-pass design, rather than adding
+separate launches. Not yet attempted; noted as a candidate for future work
+alongside bottleneck 2.
+
+## Updated status: three bottlenecks, one fixed, two open (revised)
+
+| # | Bottleneck | Status | Notes |
+|---|---|---|---|
+| 1 | Grid too small (1 block, 1/142 SMs) | **Fixed** | `kernel_splitk` (v1), verified 6x forward-kernel speedup |
+| 2 | Per-block shared memory caps occupancy at ~8.3% | Open | Not yet attempted |
+| 3 | Reduce kernel scales linearly with SPLIT_K | **Fixed algorithmically, not practically** | `kernel_splitk_v2` solves it in GPU-compute terms but loses to launch overhead in wall-clock terms; v1 remains the practical choice |
