@@ -114,3 +114,95 @@ These are two independent axes and need two independent fixes:
 - Once both bottlenecks are addressed, re-run the full 23-workload
   correctness + performance sweep (not just the one decode-style workload)
   to confirm the fix generalizes.
+
+## Phase 1 fix: adaptive BLOCK_N (unblocking high SPLIT_K)
+
+The original `dsa_fwd_kernel_splitk` used a fixed `BLOCK_N=64` regardless of
+`SPLIT_K`. At `SPLIT_K=32`, `chunk_size = topk // SPLIT_K = 64 = BLOCK_N`,
+so the inner KV loop ran exactly once — this specific configuration
+triggered a Triton shared-memory compilation failure
+(`OutOfResources: shared memory, Required: 116736, Hardware limit:
+101376`), unrelated to the two runtime bottlenecks described above.
+
+**Fix:** made `BLOCK_N` adaptive —
+`BLOCK_N = min(64, max(16, chunk_size // 2))` — keeping the inner loop at
+≥2 iterations while respecting Triton's tensor-core minimum dot-product
+dimension (16). Verified exact-match correctness (`max_abs_err=0.0`)
+against `kernel()` across `SPLIT_K = 2, 4, 8, 16, 32, 64, 128`.
+
+## Phase 2: SPLIT_K sweep — a third bottleneck found
+
+With Phase 1's fix unblocking the full range, swept `SPLIT_K` from 2 to 128
+on the same workload (`uuid=0c23b10c...`).
+
+### Wall-clock latency (torch.cuda.Event, 50 iters, `profile_kernel_splitk.py`)
+
+| SPLIT_K | Avg latency |
+|---|---|
+| 2 | 69.7 μs |
+| 4 | 69.4 μs |
+| 8 | 71.6 μs |
+| 16 | 68.3 μs |
+| 32 | 69.9 μs |
+| 64 | 70.8 μs |
+| 128 | **127.7 μs** |
+
+Latency is essentially flat from `SPLIT_K=2` through `64` (~68-72 μs), then
+nearly doubles at `128`. This was unexpected — if the only bottleneck were
+grid-size underutilization (bottleneck 1) or per-block occupancy
+(bottleneck 2), higher `SPLIT_K` should keep helping (or at least not
+actively hurt) up to the GPU's SM count (142). Something else dominates at
+high `SPLIT_K`.
+
+### Kernel-level breakdown (nsys, forward vs. reduce kernel separately)
+
+| SPLIT_K | `dsa_fwd_kernel_splitk` | `dsa_reduce_kernel` | Reduce/Forward ratio |
+|---|---|---|---|
+| 16 | 9,578 ns | 11,907 ns | 1.2x |
+| 64 | 5,494 ns | 54,794 ns | **10x** |
+| 128 | 4,285 ns | 111,994 ns | **26x** |
+
+This isolates the cause precisely: **the forward kernel keeps improving as
+SPLIT_K grows** (9.6 → 5.5 → 4.3 μs, more parallelism helping as expected),
+but **`dsa_reduce_kernel`'s cost scales roughly linearly with SPLIT_K**
+(12 → 55 → 112 μs — doubling from 64→128, matching SPLIT_K doubling). At
+high SPLIT_K, the reduce kernel completely dominates and erases the
+forward kernel's gains.
+
+### Bottleneck 3 (NOT YET FIXED): sequential reduction
+
+`dsa_reduce_kernel` merges `SPLIT_K` partial results using
+`for split_id in t1.static_range(SPLIT_K):` — a compile-time-unrolled,
+**strictly sequential** loop inside a single program per token. Its cost is
+therefore directly proportional to `SPLIT_K`, with no parallelism at all
+across splits. This is architecturally different from bottlenecks 1 and 2
+(which are both about underutilizing the GPU's parallelism) — this one is
+about an *intentionally* serial merge step that doesn't scale.
+
+**Practical consequence:** the useful operating range for `SPLIT_K` on this
+workload is roughly **8–16**, where forward-kernel gains and reduce-kernel
+cost are still roughly balanced (reduce/forward ratio ~1-2x). Beyond that,
+total latency gets worse, not better, despite the forward kernel itself
+continuing to improve.
+
+### Candidate fixes for bottleneck 3 (not yet implemented)
+
+1. **Tree/hierarchical reduction** — merge splits pairwise across
+   `log2(SPLIT_K)` sequential passes instead of one `SPLIT_K`-length linear
+   scan, each pass parallel across pairs.
+2. **Multi-threaded reduction within the block** — spread the `SPLIT_K`
+   partial-result loads/merges across threads in `dsa_reduce_kernel`'s
+   block instead of a single-threaded sequential loop.
+3. **Cap SPLIT_K empirically** (8-16 for this workload shape) and accept
+   the reduce kernel's cost at that scale as a simpler, "good enough"
+   solution — avoids the added engineering complexity of options 1/2, at
+   the cost of not fully solving bottlenecks 1/2 (some occupancy headroom
+   at higher SPLIT_K left unused).
+
+## Updated status: three bottlenecks identified, one fixed, two open
+
+| # | Bottleneck | Status | Fix |
+|---|---|---|---|
+| 1 | Grid too small (1 block, 1/142 SMs) | **Fixed** | Split-K forward kernel |
+| 2 | Per-block shared memory caps occupancy at ~8.3% | Open | Reduce shared-mem footprint (tiling, lower precision) |
+| 3 | Reduce kernel scales linearly with SPLIT_K, caps useful SPLIT_K at ~16 | Open | Tree reduction or parallel merge |
