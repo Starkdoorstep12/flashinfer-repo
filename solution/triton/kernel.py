@@ -330,3 +330,231 @@ cale : float
     # lse    : [num_tokens, num_qo_heads]                float32
 
     return output, lse
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Split-K variant: parallelizes the topk (KV) dimension across multiple
+# thread blocks per token, instead of one block handling all topk=2048
+# entries serially. Fixes SM underutilization for decode-style workloads
+# (num_tokens=1) where the original per-token grid launches too few blocks
+# to fill the GPU. See docs/PROFILING.md for the baseline diagnosis.
+# ═══════════════════════════════════════════════════════════════════════════
+
+@triton.jit
+def dsa_fwd_kernel_splitk(
+    Q_NOPE, Q_PE, CKV_CACHE, KPE_CACHE, SPARSE_INDICES,
+    PARTIAL_ACC, PARTIAL_M, PARTIAL_L,
+    sm_scale,
+    stride_qt_tok, stride_qt_h, stride_qt_d,
+    stride_qpe_tok, stride_qpe_h, stride_qpe_d,
+    stride_ckv_page, stride_ckv_tok, stride_ckv_d,
+    stride_kpe_page, stride_kpe_tok, stride_kpe_d,
+    stride_idx_tok, stride_idx_k,
+    stride_pacc_tok, stride_pacc_split, stride_pacc_h, stride_pacc_d,
+    stride_pm_tok, stride_pm_split, stride_pm_h,
+    stride_pl_tok, stride_pl_split, stride_pl_h,
+    page_size: t1.constexpr, topk: t1.constexpr,
+    SPLIT_K: t1.constexpr,
+    BLOCK_N: t1.constexpr,
+    BLOCK_D_CKV: t1.constexpr,
+    BLOCK_D_KPE: t1.constexpr,
+    BLOCK_H: t1.constexpr,
+):
+    # Each program now handles ONE (token, split) pair, instead of one
+    # program owning the entire topk loop for a token. This multiplies the
+    # grid size by SPLIT_K, giving the GPU SPLIT_K times more independent
+    # blocks to schedule across SMs.
+    tok_id = t1.program_id(0)
+    split_id = t1.program_id(1)
+
+    # chunk = how many of the topk sparse indices this program is responsible for
+    chunk = topk // SPLIT_K
+    chunk_start = split_id * chunk
+
+    offs_h = t1.arange(0, BLOCK_H)
+    offs_d_ckv = t1.arange(0, BLOCK_D_CKV)
+    offs_d_kpe = t1.arange(0, BLOCK_D_KPE)
+
+    q_nope_ptrs = Q_NOPE + tok_id * stride_qt_tok + offs_h[:, None] * stride_qt_h + offs_d_ckv[None, :] * stride_qt_d
+    q_nope = t1.load(q_nope_ptrs)
+
+    q_pe_ptrs = Q_PE + tok_id * stride_qpe_tok + offs_h[:, None] * stride_qpe_h + offs_d_kpe[None, :] * stride_qpe_d
+    q_pe = t1.load(q_pe_ptrs)
+
+    # Same online-softmax accumulators as the original kernel, but scoped
+    # only to this program's chunk of the topk KV tokens — this is a
+    # PARTIAL result, not the final answer.
+    m_i = t1.full([BLOCK_H], -float("inf"), dtype=t1.float32)
+    l_i = t1.zeros([BLOCK_H], dtype=t1.float32)
+    acc = t1.zeros([BLOCK_H, BLOCK_D_CKV], dtype=t1.float32)
+
+    for n_start in range(0, chunk, BLOCK_N):
+        offs_n = chunk_start + n_start + t1.arange(0, BLOCK_N)
+        idx_ptrs = SPARSE_INDICES + tok_id * stride_idx_tok + offs_n * stride_idx_k
+
+        mask_n = offs_n < (chunk_start + chunk)
+        mask_n &= offs_n < topk
+
+        indices = t1.load(idx_ptrs, mask=mask_n, other=-1)
+        valid_mask_col = indices[:, None] != -1
+        valid_mask_row = indices[None, :] != -1
+
+        page_idx = indices // page_size
+        tok_offset = indices % page_size
+
+        k_kpe_ptrs = KPE_CACHE + page_idx[:, None] * stride_kpe_page + tok_offset[:, None] * stride_kpe_tok + offs_d_kpe[None, :] * stride_kpe_d
+        k_kpe = t1.load(k_kpe_ptrs, mask=valid_mask_col, other=0.0)
+
+        k_ckv_ptrs = CKV_CACHE + page_idx[:, None] * stride_ckv_page + tok_offset[:, None] * stride_ckv_tok + offs_d_ckv[None, :] * stride_ckv_d
+        k_ckv = t1.load(k_ckv_ptrs, mask=valid_mask_col, other=0.0)
+
+        qk_nope = t1.dot(q_nope, k_ckv.T)
+        qk_pe = t1.dot(q_pe, k_kpe.T)
+        qk = (qk_nope + qk_pe) * sm_scale
+        qk = t1.where(valid_mask_row, qk, -float("inf"))
+        m_ij = t1.maximum(m_i, t1.max(qk, axis=1))
+        m_ij_finite_col = m_ij[:, None] != -float("inf")
+        p = t1.where(m_ij_finite_col, t1.exp(qk - m_ij[:, None]), 0.0)
+        alpha = t1.where(m_i == -float("inf"), 0.0, t1.exp(m_i - m_ij))
+        l_i = l_i * alpha + t1.sum(p, axis=1)
+        m_i = m_ij
+        acc = acc * alpha[:, None]
+        acc += t1.dot(p.to(t1.bfloat16), k_ckv)
+
+    # Write PARTIAL state (not normalized, not final) to scratch buffers.
+    # The reduce kernel combines these across SPLIT_K per token.
+    pacc_ptrs = (PARTIAL_ACC + tok_id * stride_pacc_tok + split_id * stride_pacc_split
+                 + offs_h[:, None] * stride_pacc_h + offs_d_ckv[None, :] * stride_pacc_d)
+    t1.store(pacc_ptrs, acc)
+
+    pm_ptrs = PARTIAL_M + tok_id * stride_pm_tok + split_id * stride_pm_split + offs_h * stride_pm_h
+    t1.store(pm_ptrs, m_i)
+
+    pl_ptrs = PARTIAL_L + tok_id * stride_pl_tok + split_id * stride_pl_split + offs_h * stride_pl_h
+    t1.store(pl_ptrs, l_i)
+
+
+@triton.jit
+def dsa_reduce_kernel(
+    PARTIAL_ACC, PARTIAL_M, PARTIAL_L, OUTPUT, LSE,
+    stride_pacc_tok, stride_pacc_split, stride_pacc_h, stride_pacc_d,
+    stride_pm_tok, stride_pm_split, stride_pm_h,
+    stride_pl_tok, stride_pl_split, stride_pl_h,
+    stride_out_tok, stride_out_h, stride_out_d,
+    stride_lse_tok, stride_lse_h,
+    SPLIT_K: t1.constexpr,
+    BLOCK_D_CKV: t1.constexpr,
+    BLOCK_H: t1.constexpr,
+):
+    # One program per token. Cheap — just combines SPLIT_K partial results
+    # using the same rescale-by-alpha trick already used inside the main
+    # loop, just applied across blocks instead of across KV tiles.
+    tok_id = t1.program_id(0)
+
+    offs_h = t1.arange(0, BLOCK_H)
+    offs_d_ckv = t1.arange(0, BLOCK_D_CKV)
+
+    m_i = t1.full([BLOCK_H], -float("inf"), dtype=t1.float32)
+    l_i = t1.zeros([BLOCK_H], dtype=t1.float32)
+    acc = t1.zeros([BLOCK_H, BLOCK_D_CKV], dtype=t1.float32)
+
+    for split_id in t1.static_range(SPLIT_K):
+        pm_ptrs = PARTIAL_M + tok_id * stride_pm_tok + split_id * stride_pm_split + offs_h * stride_pm_h
+        m_split = t1.load(pm_ptrs)
+
+        pl_ptrs = PARTIAL_L + tok_id * stride_pl_tok + split_id * stride_pl_split + offs_h * stride_pl_h
+        l_split = t1.load(pl_ptrs)
+
+        pacc_ptrs = (PARTIAL_ACC + tok_id * stride_pacc_tok + split_id * stride_pacc_split
+                     + offs_h[:, None] * stride_pacc_h + offs_d_ckv[None, :] * stride_pacc_d)
+        acc_split = t1.load(pacc_ptrs)
+
+        m_new = t1.maximum(m_i, m_split)
+        # Guard against -inf - (-inf) = NaN when neither this split nor the
+        # accumulated state so far has seen any valid token yet.
+        alpha_old = t1.where(m_i == -float("inf"), 0.0, t1.exp(m_i - m_new))
+        alpha_split = t1.where(m_split == -float("inf"), 0.0, t1.exp(m_split - m_new))
+
+        l_i = l_i * alpha_old + l_split * alpha_split
+        acc = acc * alpha_old[:, None] + acc_split * alpha_split[:, None]
+        m_i = m_new
+
+    m_i_finite = m_i != -float("inf")
+    m_i_finite_col = m_i[:, None] != -float("inf")
+    acc_out = t1.where(m_i_finite_col, acc / l_i[:, None], 0.0)
+
+    out_ptrs = OUTPUT + tok_id * stride_out_tok + offs_h[:, None] * stride_out_h + offs_d_ckv[None, :] * stride_out_d
+    t1.store(out_ptrs, acc_out.to(t1.bfloat16))
+
+    math_log2 = 0.6931471805599453
+    lse = (m_i + t1.log(l_i)) / math_log2
+    lse_out = t1.where(m_i_finite, lse, -float("inf"))
+    lse_ptrs = LSE + tok_id * stride_lse_tok + offs_h * stride_lse_h
+    t1.store(lse_ptrs, lse_out)
+
+
+def kernel_splitk(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, SPLIT_K=16):
+    """
+    Drop-in alternative to kernel() that parallelizes the topk KV dimension
+    across SPLIT_K blocks per token, instead of one block per token handling
+    the full topk=2048 loop serially. Same signature/output as kernel().
+    """
+    num_tokens, num_qo_heads, head_dim_ckv = q_nope.shape
+    num_pages, page_size, _ = ckv_cache.shape
+    head_dim_kpe = q_pe.shape[-1]
+    topk = sparse_indices.shape[-1]
+
+    assert num_qo_heads == 16
+    assert head_dim_ckv == 512
+    assert head_dim_kpe == 64
+    assert page_size == 64
+    assert topk == 2048
+    assert topk % SPLIT_K == 0, f"topk={topk} must be divisible by SPLIT_K={SPLIT_K}"
+
+    device = q_nope.device
+
+    output = torch.zeros((num_tokens, num_qo_heads, head_dim_ckv), dtype=torch.bfloat16, device=device)
+    lse = torch.full((num_tokens, num_qo_heads), fill_value=-float("inf"), dtype=torch.float32, device=device)
+
+    # Scratch buffers for partial results, one slot per (token, split, head)
+    partial_acc = torch.zeros((num_tokens, SPLIT_K, num_qo_heads, head_dim_ckv), dtype=torch.float32, device=device)
+    partial_m = torch.full((num_tokens, SPLIT_K, num_qo_heads), -float("inf"), dtype=torch.float32, device=device)
+    partial_l = torch.zeros((num_tokens, SPLIT_K, num_qo_heads), dtype=torch.float32, device=device)
+
+    BLOCK_N = 64
+
+    grid_splitk = (num_tokens, SPLIT_K)
+    dsa_fwd_kernel_splitk[grid_splitk](
+        q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices,
+        partial_acc, partial_m, partial_l,
+        sm_scale,
+        q_nope.stride(0), q_nope.stride(1), q_nope.stride(2),
+        q_pe.stride(0), q_pe.stride(1), q_pe.stride(2),
+        ckv_cache.stride(0), ckv_cache.stride(1), ckv_cache.stride(2),
+        kpe_cache.stride(0), kpe_cache.stride(1), kpe_cache.stride(2),
+        sparse_indices.stride(0), sparse_indices.stride(1),
+        partial_acc.stride(0), partial_acc.stride(1), partial_acc.stride(2), partial_acc.stride(3),
+        partial_m.stride(0), partial_m.stride(1), partial_m.stride(2),
+        partial_l.stride(0), partial_l.stride(1), partial_l.stride(2),
+        page_size=page_size, topk=topk,
+        SPLIT_K=SPLIT_K,
+        BLOCK_N=BLOCK_N,
+        BLOCK_D_CKV=head_dim_ckv,
+        BLOCK_D_KPE=head_dim_kpe,
+        BLOCK_H=num_qo_heads,
+    )
+
+    grid_reduce = (num_tokens,)
+    dsa_reduce_kernel[grid_reduce](
+        partial_acc, partial_m, partial_l, output, lse,
+        partial_acc.stride(0), partial_acc.stride(1), partial_acc.stride(2), partial_acc.stride(3),
+        partial_m.stride(0), partial_m.stride(1), partial_m.stride(2),
+        partial_l.stride(0), partial_l.stride(1), partial_l.stride(2),
+        output.stride(0), output.stride(1), output.stride(2),
+        lse.stride(0), lse.stride(1),
+        SPLIT_K=SPLIT_K,
+        BLOCK_D_CKV=head_dim_ckv,
+        BLOCK_H=num_qo_heads,
+    )
+
+    return output, lse
