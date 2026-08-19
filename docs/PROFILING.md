@@ -101,12 +101,10 @@ problem.
 
 ## After optimization
 
-_TODO: re-run the same profiling commands against the split-K
-implementation and fill in the comparison table below once built._
-
-| Metric | Before | After |
-|---|---|---|
-| Latency | 92.4 μs | TBD |
-| Grid size | 1 block | TBD |
-| Achieved Occupancy | 8.33% | TBD |
-| Compute/Memory Throughput | 0.23% / 0.29% | TBD |
+Split-K implementation built and profiled — see `docs/SPLITK_OPTIMIZATION.md`
+for full results and analysis. Summary: forward-kernel duration dropped
+~6x (254.72us -> 42.30us at SPLIT_K=8) by fixing grid-size underutilization
+(1 -> 8 blocks). A second, independent bottleneck (per-block shared memory
+capping occupancy at ~8.3% regardless of grid size) remains and is not yet
+addressed. Nsight estimates a further ~94% speedup available from pushing
+SPLIT_K higher, separate from the shared-memory constraint.
