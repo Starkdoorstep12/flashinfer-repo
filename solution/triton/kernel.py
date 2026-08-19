@@ -513,6 +513,12 @@ def kernel_splitk(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, 
 
     device = q_nope.device
 
+    # Chunk size per split. At high SPLIT_K, chunk gets small; if BLOCK_N
+    # equals chunk exactly, the inner loop runs exactly once, which has been
+    # observed to blow past Triton's shared-memory pipelining budget on this
+    # kernel (OutOfResources at SPLIT_K=32 with a fixed BLOCK_N=64). Keeping
+    # BLOCK_N <= chunk // 2 (loop runs >=2 iterations) avoids this.
+
     output = torch.zeros((num_tokens, num_qo_heads, head_dim_ckv), dtype=torch.bfloat16, device=device)
     lse = torch.full((num_tokens, num_qo_heads), fill_value=-float("inf"), dtype=torch.float32, device=device)
 
@@ -521,7 +527,8 @@ def kernel_splitk(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, 
     partial_m = torch.full((num_tokens, SPLIT_K, num_qo_heads), -float("inf"), dtype=torch.float32, device=device)
     partial_l = torch.zeros((num_tokens, SPLIT_K, num_qo_heads), dtype=torch.float32, device=device)
 
-    BLOCK_N = 64
+    chunk_size = topk // SPLIT_K
+    BLOCK_N = min(64, max(16, chunk_size // 2))
 
     grid_splitk = (num_tokens, SPLIT_K)
     dsa_fwd_kernel_splitk[grid_splitk](
