@@ -371,3 +371,207 @@ atomic-counter single-launch redesign — a design that specifically
 eliminates both of the two *largest* named costs (extra launches AND extra
 intermediate allocations) simultaneously, rather than addressing either in
 isolation.
+
+## Experiment 3: single-launch design via atomic-counter synchronization (kernel_splitk_v3)
+
+Motivated directly by Experiment 2's decomposition: v2 lost to v1 on
+wall-clock latency primarily because of two named, measured costs —
+kernel-launch dispatch (~7.3 μs/launch) and intermediate-buffer allocation
+(~16.7 μs) — together accounting for ~70% of the gap. This section
+describes a design that targets both costs simultaneously by collapsing
+the entire forward + reduce pipeline into a **single kernel launch**.
+
+### Background: does Triton support cross-block synchronization?
+
+Before designing this, we researched whether Triton provides a safe way
+for blocks (programs) to coordinate across a single kernel launch.
+
+**Finding: general grid-wide synchronization is not safely supported.**
+One analysis of Triton kernel design states plainly that "there is no
+(grid) synchronization between programs in Triton, which makes it
+impossible to communicate values between different programs over HBM" in
+the naive sense (FlashRNN, arXiv:2412.07752). A real Triton GitHub issue
+(triton-lang/triton#7125) documents that hand-rolled spin-lock/busy-wait
+synchronization between blocks — using the pattern from Triton's own
+layer-norm backward-pass tutorial — generates unexpected extra barriers
+and shared-memory broadcast overhead, causing "a significant performance
+drop," and that atomic-op synchronization behavior is inconsistent between
+scalar and tensor operands. A naive "blocks wait on each other" design was
+judged too risky to build on top of.
+
+**Finding: a safe, established alternative exists — the "last-CTA"
+atomic-counter pattern**, used in production split-K GEMM kernels (the
+same technique CUTLASS/stream-K kernels use for cross-CTA reduction). The
+idea: every program computes its partial result and atomically increments
+a shared counter; whichever program's increment happens to return the
+final count (i.e., it finished last) proceeds to read every other
+program's partial result and perform the reduction *inline, in the same
+kernel invocation* — no busy-waiting, no second launch, just one
+conditional branch taken by exactly one of the SPLIT_K programs per token.
+
+**Finding: memory-ordering semantics matter and must be set deliberately.**
+Triton's atomic operations (`tl.atomic_add`, `tl.atomic_cas`, etc.) accept
+a `sem` parameter: `"acquire"`, `"release"`, `"acq_rel"` (the default), or
+`"relaxed"`. A published Triton split-K GEMM implementation notes that
+`relaxed` is a valid *optimization* — but only for pure accumulation, where
+no control-flow decision depends on the atomic's result. Our design is
+different: the counter is a **synchronization gate**, not a pure
+accumulator — a program's decision to enter the reduction branch depends
+on the atomic's return value. This requires the default `acq_rel`
+semantics:
+- **release** ensures a program's writes to the partial-result scratch
+  buffers (`m`, `l`, `acc`) are visible to other programs before its
+  counter increment becomes visible.
+- **acquire** ensures the "winning" program does not see stale data left
+  over from before other programs' releases when it reads all partials.
+
+`kernel_splitk_v3` uses the explicit, self-documenting `sem="acq_rel"` on
+the counter atomic and is deliberately *not* relaxed to `"relaxed"`,
+despite that being a tempting micro-optimization — doing so would
+reintroduce exactly the race condition this design is built to avoid.
+
+### Design
+
+Single kernel launch, `grid = (num_tokens, SPLIT_K)` — same shape as v1/v2's
+forward pass. Each program:
+1. Computes its partial `(m, l, acc)` for its chunk of the topk KV range —
+   identical math to `dsa_fwd_kernel_splitk`.
+2. Writes its partial result to global scratch (ordinary `t1.store`, no
+   atomics needed here — each program writes to a disjoint location).
+3. Atomically increments a per-token counter with `sem="acq_rel"`.
+4. If its increment brought the counter to `SPLIT_K` (i.e., it was last),
+   it reads **all** SPLIT_K partials and performs the reduction inline:
+   a vectorized hardware max/sum reduction for `(m, l)` (same technique as
+   v2's Phase A), followed by a sequential `for s in range(SPLIT_K)` loop
+   accumulating the weighted `acc` — sequential, but confined entirely to
+   this one winning program, with no extra kernel launch and no extra
+   intermediate-buffer allocation beyond the partial-result scratch already
+   required.
+
+This deliberately reintroduces a sequential loop over `SPLIT_K` (the same
+shape of cost that made v1 degrade at high SPLIT_K) — but the bet, informed
+directly by Experiment 2, is that avoiding launch and allocation overhead
+matters more than avoiding that sequential loop, in the practical
+SPLIT_K range.
+
+### Correctness: implementation bug, then stress testing
+
+**Implementation bug found before testing:** a first draft included dead
+code (an unused, dimensionally-invalid line attempting to recompute a
+per-split value via a masked-sum trick, left over from an earlier draft of
+the accumulation logic). This caused `CompilationError` at `SPLIT_K = 2, 4,
+8` but — notably — compiled successfully at `SPLIT_K = 16`, an inconsistency
+not fully explained (plausibly a different code-generation/unrolling path
+at that specific configuration). Removed the dead code entirely rather than
+investigate why it sometimes compiled, since it was unused regardless.
+
+**Single-run correctness:** after the fix, exact match (`max_abs_err =
+0.000000`) against `kernel()` across `SPLIT_K = 2, 4, 8, 16, 32, 64, 128`
+on the first attempt.
+
+**Why a single passing run is not sufficient evidence here:** unlike v1/v2
+(which use no cross-block synchronization primitives beyond ordinary
+writes read by a separately-launched kernel), v3's correctness depends on
+an atomic-counter race-resolution mechanism. A race condition in this kind
+of design can pass the overwhelming majority of runs and fail rarely,
+depending on GPU scheduling nondeterminism — the worst class of bug to
+leave undetected. A single clean pass is necessary but not sufficient
+evidence of correctness.
+
+**Stress test** (`stress_test_v3.py`): 200 trials per `SPLIT_K` value,
+fresh random `q_nope`/`q_pe`/`ckv_cache`/`kpe_cache` each trial (different
+seed per trial, forcing different data and therefore different exact
+kernel timing/scheduling each run), compared against `kernel()` at
+tolerance 0.02 (matching the bf16-rounding scale established throughout
+this project).
+
+**Result: 1,400/1,400 trials passed (200 trials × 7 SPLIT_K values), zero
+failures.** This is strong evidence the `acq_rel` design is correct on this
+hardware/driver/PyTorch/Triton stack — though, as with any finite stress
+test of a concurrent design, it reduces rather than eliminates the
+possibility of an undetected rare race.
+
+### Performance: v3 beats both v1 and v2 at every measured point
+
+| SPLIT_K | v1 (2 launches) | v2 (4 launches) | v3 (1 launch) |
+|---|---|---|---|
+| 2 | 69.7 μs | 114.5 μs | **62.1 μs** |
+| 4 | 69.4 μs | 111.7 μs | **61.3 μs** |
+| 8 | 71.6 μs | 114.4 μs | **60.1 μs** |
+| 16 | 68.3 μs | 112.0 μs | **61.5 μs** |
+| 32 | 69.9 μs | 114.4 μs | **61.2 μs** |
+| 64 | 70.8 μs | 113.7 μs | **62.2 μs** |
+| 128 | 127.7 μs | 115.2 μs | **94.2 μs** |
+
+v3 beats v1 by roughly 10-15% across the flat operating range (2-64), and
+by a much wider margin at the high end (94.2 μs vs. v1's 127.7 μs at
+SPLIT_K=128 — v1's worst point still loses to v3's second-worst point by
+~33 μs). v3 beats v2 everywhere, typically by close to half.
+
+v3's latency stays flatter across the sweep than either v1 or v2 (~60-62 μs
+from SPLIT_K=2 through 64), degrading only at 128 — consistent with the
+inline sequential accumulation loop inside the winning program starting to
+cost real time once SPLIT_K is large enough that 128 sequential
+load-multiply-add steps over a `[16, 512]` tensor is nontrivial work, even
+with zero added launch/allocation overhead.
+
+### Summary: the complete three-version arc
+
+1. **v1** (naive split-K, sequential reduce): fixes the original
+   grid-size-underutilization bottleneck; degrades at high SPLIT_K due to
+   an O(SPLIT_K) sequential reduction.
+2. **v2** ("obviously better" fully-parallel reduction): fixes the
+   algorithmic scaling problem in raw GPU compute terms — but *loses* in
+   practice, because it doubles kernel-launch count and adds new
+   intermediate-buffer allocations, both quantified in Experiment 2 as the
+   dominant costs in this regime.
+3. **v3** (single-launch, atomic-counter-gated inline reduction): designed
+   specifically in response to Experiment 2's decomposition — eliminates
+   both of the two largest named costs (extra launches, extra allocations)
+   simultaneously, accepting a sequential reduction step (like v1) but
+   confined to a single program with no launch penalty. **Wins outright**
+   against both v1 and v2 at every measured SPLIT_K.
+
+This is not "we tried an optimization and it worked" — it is a
+diagnosis-fix-measure-refine loop: the failure of the "obvious" fix (v2)
+was itself decomposed into named causes, and that decomposition directly
+produced the design that succeeded (v3).
+
+## Updated status: three bottlenecks, all addressed (final)
+
+| # | Bottleneck | Status | Fix |
+|---|---|---|---|
+| 1 | Grid too small (1 block, 1/142 SMs) | **Fixed** | Split-K forward kernel (v1/v3) |
+| 2 | Per-block shared memory caps occupancy at ~8.3% | Open | Not yet attempted — candidate future work |
+| 3 | Reduce kernel scales linearly with SPLIT_K / launch+allocation overhead dominates naive fixes | **Fixed** | `kernel_splitk_v3`: single-launch, atomic-counter-gated inline reduction; verified via 1,400-trial stress test; beats v1 and v2 at every measured SPLIT_K |
+
+**Current recommendation: `kernel_splitk_v3` is the best-performing,
+correctness-stress-tested configuration on RTX 6000 Ada.** Bottleneck 2
+(shared memory / per-block occupancy) remains the one unaddressed axis and
+is noted as future work, ideally revisited with cross-architecture context
+once profiling extends to A100/L40S/DGX Spark, since shared-memory budgets
+and launch-overhead characteristics may both differ meaningfully across
+architectures.
+
+### Note: ncu unavailable for v3 profiling on this run
+
+Attempted `ncu` occupancy/throughput profiling of `dsa_fwd_kernel_splitk_v3`
+but hit `Profiling failed because a driver resource was unavailable` —
+traced to a persistent, admin-run `nvidia-dcgm` service (`dcgm-exporter`,
+running continuously on this node for cluster-wide GPU monitoring) holding
+exclusive access to the hardware performance-counter registers `ncu`
+needs. Confirmed via `ps aux | grep dcgm` and `systemctl status
+nvidia-dcgm` — not caused by our code or job, and not something fixable
+from a user account. `nsys` (used for all wall-clock timing throughout this
+project) is unaffected by this conflict. Deferred: retry `ncu` profiling of
+v3 opportunistically, or flag to cluster admins if it recurs.
+
+### Note: ncu unavailable for v3 profiling in this session
+
+Attempted `ncu` occupancy/throughput profiling of `dsa_fwd_kernel_splitk_v3`
+but hit a resource conflict with the cluster's persistent DCGM monitoring
+service — an infrastructure/methodology issue, not a property of the
+kernel. See `docs/INFRASTRUCTURE_NOTES.md` for full diagnosis. The v3
+performance result above (wall-clock comparison + 1,400-trial stress test)
+is unaffected, since it relies on `nsys`/`torch.cuda.Event` timing, not
+`ncu`.

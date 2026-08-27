@@ -797,3 +797,225 @@ def kernel_splitk_v2(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scal
     )
 
     return output, lse
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Split-K v3: single-launch design using an atomic counter as a
+# synchronization gate ("last CTA does the reduction"), informed by
+# Experiment 2's finding that kernel-launch dispatch (~7.3us/launch) and
+# intermediate-buffer allocation (~16.7us) — not reduction algorithm
+# complexity — dominate the wall-clock cost in the practical SPLIT_K range.
+#
+# Each program computes its partial result exactly as dsa_fwd_kernel_splitk
+# does, then atomically increments a per-token counter. The one program
+# whose atomic_add returns SPLIT_K-1 (i.e. it was the last to finish) then
+# reads all SPLIT_K partials and performs the reduction inline — no second
+# kernel launch, no separate intermediate-buffer allocations beyond the
+# scratch already required for partial results.
+#
+# CORRECTNESS-CRITICAL: the counter atomic MUST use acq_rel (or an
+# explicit release+acquire pair), NOT relaxed. This is not a pure
+# accumulator (where relaxed would be safe) — it is a synchronization gate.
+# release ensures this program's writes to the partial-result scratch
+# buffers are visible to other programs before the counter update is
+# visible; acquire ensures the "last" program does not see stale data left
+# over from before other programs' releases. Do not "optimize" this to
+# relaxed — see docs/SPLITK_OPTIMIZATION.md, Experiment 3 for the reasoning
+# and the Triton/CUDA split-K precedent this follows.
+# ═══════════════════════════════════════════════════════════════════════════
+
+@triton.jit
+def dsa_fwd_kernel_splitk_v3(
+    Q_NOPE, Q_PE, CKV_CACHE, KPE_CACHE, SPARSE_INDICES,
+    PARTIAL_ACC, PARTIAL_M, PARTIAL_L, COUNTER, OUTPUT, LSE,
+    sm_scale,
+    stride_qt_tok, stride_qt_h, stride_qt_d,
+    stride_qpe_tok, stride_qpe_h, stride_qpe_d,
+    stride_ckv_page, stride_ckv_tok, stride_ckv_d,
+    stride_kpe_page, stride_kpe_tok, stride_kpe_d,
+    stride_idx_tok, stride_idx_k,
+    stride_pacc_tok, stride_pacc_split, stride_pacc_h, stride_pacc_d,
+    stride_pm_tok, stride_pm_split, stride_pm_h,
+    stride_pl_tok, stride_pl_split, stride_pl_h,
+    stride_out_tok, stride_out_h, stride_out_d,
+    stride_lse_tok, stride_lse_h,
+    page_size: t1.constexpr, topk: t1.constexpr,
+    SPLIT_K: t1.constexpr,
+    BLOCK_N: t1.constexpr,
+    BLOCK_D_CKV: t1.constexpr,
+    BLOCK_D_KPE: t1.constexpr,
+    BLOCK_H: t1.constexpr,
+):
+    tok_id = t1.program_id(0)
+    split_id = t1.program_id(1)
+
+    offs_h = t1.arange(0, BLOCK_H)
+    offs_d_ckv = t1.arange(0, BLOCK_D_CKV)
+    offs_d_kpe = t1.arange(0, BLOCK_D_KPE)
+
+    # ── Forward pass: identical to dsa_fwd_kernel_splitk ──────────────────
+    q_nope_ptrs = Q_NOPE + tok_id * stride_qt_tok + offs_h[:, None] * stride_qt_h + offs_d_ckv[None, :] * stride_qt_d
+    q_nope = t1.load(q_nope_ptrs)
+
+    q_pe_ptrs = Q_PE + tok_id * stride_qpe_tok + offs_h[:, None] * stride_qpe_h + offs_d_kpe[None, :] * stride_qpe_d
+    q_pe = t1.load(q_pe_ptrs)
+
+    m_i = t1.full([BLOCK_H], -float("inf"), dtype=t1.float32)
+    l_i = t1.zeros([BLOCK_H], dtype=t1.float32)
+    acc = t1.zeros([BLOCK_H, BLOCK_D_CKV], dtype=t1.float32)
+
+    chunk = topk // SPLIT_K
+    chunk_start = split_id * chunk
+
+    for n_start in range(0, chunk, BLOCK_N):
+        offs_n = chunk_start + n_start + t1.arange(0, BLOCK_N)
+        idx_ptrs = SPARSE_INDICES + tok_id * stride_idx_tok + offs_n * stride_idx_k
+
+        mask_n = offs_n < (chunk_start + chunk)
+        mask_n &= offs_n < topk
+
+        indices = t1.load(idx_ptrs, mask=mask_n, other=-1)
+        valid_mask_col = indices[:, None] != -1
+        valid_mask_row = indices[None, :] != -1
+
+        page_idx = indices // page_size
+        tok_offset = indices % page_size
+
+        k_kpe_ptrs = KPE_CACHE + page_idx[:, None] * stride_kpe_page + tok_offset[:, None] * stride_kpe_tok + offs_d_kpe[None, :] * stride_kpe_d
+        k_kpe = t1.load(k_kpe_ptrs, mask=valid_mask_col, other=0.0)
+
+        k_ckv_ptrs = CKV_CACHE + page_idx[:, None] * stride_ckv_page + tok_offset[:, None] * stride_ckv_tok + offs_d_ckv[None, :] * stride_ckv_d
+        k_ckv = t1.load(k_ckv_ptrs, mask=valid_mask_col, other=0.0)
+
+        qk_nope = t1.dot(q_nope, k_ckv.T)
+        qk_pe = t1.dot(q_pe, k_kpe.T)
+        qk = (qk_nope + qk_pe) * sm_scale
+        qk = t1.where(valid_mask_row, qk, -float("inf"))
+
+        m_ij = t1.maximum(m_i, t1.max(qk, axis=1))
+        m_ij_finite_col = m_ij[:, None] != -float("inf")
+        p = t1.where(m_ij_finite_col, t1.exp(qk - m_ij[:, None]), 0.0)
+        alpha = t1.where(m_i == -float("inf"), 0.0, t1.exp(m_i - m_ij))
+        l_i = l_i * alpha + t1.sum(p, axis=1)
+        m_i = m_ij
+        acc = acc * alpha[:, None]
+        acc += t1.dot(p.to(t1.bfloat16), k_ckv)
+
+    # ── Write partial result to scratch (visible to all programs via HBM) ─
+    pacc_ptrs = (PARTIAL_ACC + tok_id * stride_pacc_tok + split_id * stride_pacc_split
+                 + offs_h[:, None] * stride_pacc_h + offs_d_ckv[None, :] * stride_pacc_d)
+    t1.store(pacc_ptrs, acc)
+
+    pm_ptrs = PARTIAL_M + tok_id * stride_pm_tok + split_id * stride_pm_split + offs_h * stride_pm_h
+    t1.store(pm_ptrs, m_i)
+
+    pl_ptrs = PARTIAL_L + tok_id * stride_pl_tok + split_id * stride_pl_split + offs_h * stride_pl_h
+    t1.store(pl_ptrs, l_i)
+
+    # ── Synchronization gate: atomic counter with acq_rel semantics ───────
+    # release: ensures the writes above are visible before this increment
+    #          becomes visible to other programs.
+    # acquire (on the "winning" program's subsequent reads): ensures it
+    #          sees all other programs' writes, not stale data.
+    # DO NOT change sem to "relaxed" — see module docstring above.
+    count_ptr = COUNTER + tok_id
+    old_count = t1.atomic_add(count_ptr, 1, sem="acq_rel")
+    is_last = (old_count + 1) == SPLIT_K
+
+    if is_last:
+        # ── Inline reduction: this program only, no extra kernel launch ──
+        offs_s = t1.arange(0, SPLIT_K)
+
+        pm_all_ptrs = PARTIAL_M + tok_id * stride_pm_tok + offs_s[:, None] * stride_pm_split + offs_h[None, :] * stride_pm_h
+        m_split = t1.load(pm_all_ptrs)  # [SPLIT_K, BLOCK_H]
+
+        pl_all_ptrs = PARTIAL_L + tok_id * stride_pl_tok + offs_s[:, None] * stride_pl_split + offs_h[None, :] * stride_pl_h
+        l_split = t1.load(pl_all_ptrs)  # [SPLIT_K, BLOCK_H]
+
+        m_final = t1.max(m_split, axis=0)  # [BLOCK_H], vectorized hardware reduction
+        m_final_row = m_final[None, :]
+        finite_mask = m_final_row != -float("inf")
+        alpha_s = t1.where(finite_mask, t1.exp(m_split - m_final_row), 0.0)  # [SPLIT_K, BLOCK_H]
+        l_final = t1.sum(alpha_s * l_split, axis=0)  # [BLOCK_H]
+
+        # acc accumulation: sequential over SPLIT_K, but only in this ONE
+        # winning program, with no separate kernel launch or extra
+        # allocation — the tradeoff Experiment 2's decomposition motivates.
+        acc_final = t1.zeros([BLOCK_H, BLOCK_D_CKV], dtype=t1.float32)
+        for s in range(SPLIT_K):
+            pacc_s_ptrs = (PARTIAL_ACC + tok_id * stride_pacc_tok + s * stride_pacc_split
+                           + offs_h[:, None] * stride_pacc_h + offs_d_ckv[None, :] * stride_pacc_d)
+            acc_s = t1.load(pacc_s_ptrs)
+
+            alpha_row = t1.sum(t1.where(offs_s[:, None] == s, alpha_s, 0.0), axis=0)  # [BLOCK_H]
+            acc_final += alpha_row[:, None] * acc_s
+
+        m_finite = m_final != -float("inf")
+        m_finite_col = m_final[:, None] != -float("inf")
+        acc_out = t1.where(m_finite_col, acc_final / l_final[:, None], 0.0)
+
+        out_ptrs = OUTPUT + tok_id * stride_out_tok + offs_h[:, None] * stride_out_h + offs_d_ckv[None, :] * stride_out_d
+        t1.store(out_ptrs, acc_out.to(t1.bfloat16))
+
+        math_log2 = 0.6931471805599453
+        lse = (m_final + t1.log(l_final)) / math_log2
+        lse_out = t1.where(m_finite, lse, -float("inf"))
+        lse_ptrs = LSE + tok_id * stride_lse_tok + offs_h * stride_lse_h
+        t1.store(lse_ptrs, lse_out)
+
+
+def kernel_splitk_v3(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, SPLIT_K=16):
+    """
+    Single-launch split-K variant using an atomic-counter synchronization
+    gate ("last CTA does the reduction"). See module docstring above and
+    docs/SPLITK_OPTIMIZATION.md, Experiment 3.
+    """
+    num_tokens, num_qo_heads, head_dim_ckv = q_nope.shape
+    num_pages, page_size, _ = ckv_cache.shape
+    head_dim_kpe = q_pe.shape[-1]
+    topk = sparse_indices.shape[-1]
+
+    assert num_qo_heads == 16
+    assert head_dim_ckv == 512
+    assert head_dim_kpe == 64
+    assert page_size == 64
+    assert topk == 2048
+    assert topk % SPLIT_K == 0, f"topk={topk} must be divisible by SPLIT_K={SPLIT_K}"
+
+    device = q_nope.device
+
+    output = torch.zeros((num_tokens, num_qo_heads, head_dim_ckv), dtype=torch.bfloat16, device=device)
+    lse = torch.full((num_tokens, num_qo_heads), fill_value=-float("inf"), dtype=torch.float32, device=device)
+
+    partial_acc = torch.zeros((num_tokens, SPLIT_K, num_qo_heads, head_dim_ckv), dtype=torch.float32, device=device)
+    partial_m = torch.full((num_tokens, SPLIT_K, num_qo_heads), -float("inf"), dtype=torch.float32, device=device)
+    partial_l = torch.zeros((num_tokens, SPLIT_K, num_qo_heads), dtype=torch.float32, device=device)
+    counter = torch.zeros((num_tokens,), dtype=torch.int32, device=device)
+
+    chunk_size = topk // SPLIT_K
+    BLOCK_N = min(64, max(16, chunk_size // 2))
+
+    grid = (num_tokens, SPLIT_K)
+    dsa_fwd_kernel_splitk_v3[grid](
+        q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices,
+        partial_acc, partial_m, partial_l, counter, output, lse,
+        sm_scale,
+        q_nope.stride(0), q_nope.stride(1), q_nope.stride(2),
+        q_pe.stride(0), q_pe.stride(1), q_pe.stride(2),
+        ckv_cache.stride(0), ckv_cache.stride(1), ckv_cache.stride(2),
+        kpe_cache.stride(0), kpe_cache.stride(1), kpe_cache.stride(2),
+        sparse_indices.stride(0), sparse_indices.stride(1),
+        partial_acc.stride(0), partial_acc.stride(1), partial_acc.stride(2), partial_acc.stride(3),
+        partial_m.stride(0), partial_m.stride(1), partial_m.stride(2),
+        partial_l.stride(0), partial_l.stride(1), partial_l.stride(2),
+        output.stride(0), output.stride(1), output.stride(2),
+        lse.stride(0), lse.stride(1),
+        page_size=page_size, topk=topk,
+        SPLIT_K=SPLIT_K,
+        BLOCK_N=BLOCK_N,
+        BLOCK_D_CKV=head_dim_ckv,
+        BLOCK_D_KPE=head_dim_kpe,
+        BLOCK_H=num_qo_heads,
+    )
+
+    return output, lse
