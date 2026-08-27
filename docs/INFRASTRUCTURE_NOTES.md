@@ -93,3 +93,11 @@ kernel, job, or account.
   session it was collected on, so any future gaps or inconsistencies can
   be traced back to this kind of environmental cause rather than assumed
   to be a code regression.
+
+### Retry attempted
+
+Retried `ncu` profiling of v3 in a later session — same error, same
+conflict. Confirms this is a persistent lock on this node during this
+period, not a one-off timing fluke. Will retry again later (different
+session/time) or raise with cluster admins if it continues to block
+occupancy-comparison work.
