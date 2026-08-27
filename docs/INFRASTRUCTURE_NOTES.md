@@ -146,3 +146,17 @@ pausing DCGM at the `nv-hostengine` level directly (root-only) or a
 cluster-side fix to GPU device-index mapping between SLURM job allocation
 and DCGM's device view. Raised with the department's technical support
 group; awaiting response.
+
+### Additional detail: node-specific, not intermittent
+
+Reproduced the `dcgmi profile --pause`/`ncu` failure a third time,
+identical result each time on `node03`. Notably, `ncu` **did** work
+successfully earlier in this project on different nodes (`node01`,
+`node02`) — see the baseline and v1 profiling results in this project,
+both collected without issue. This suggests the conflict may be specific
+to `node03`'s DCGM configuration/instance rather than a universal property
+of every node on the Turing cluster, though the driver version reported by
+`nvidia-smi` looked identical across nodes when checked. Worth including
+this detail (node-specific reproduction) when raising with cluster admins,
+since it narrows the likely cause and may point to a configuration
+difference on this particular node rather than a cluster-wide policy.
