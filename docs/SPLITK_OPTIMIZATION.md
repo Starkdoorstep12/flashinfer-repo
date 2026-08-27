@@ -302,3 +302,72 @@ alongside bottleneck 2.
 | 1 | Grid too small (1 block, 1/142 SMs) | **Fixed** | `kernel_splitk` (v1), verified 6x forward-kernel speedup |
 | 2 | Per-block shared memory caps occupancy at ~8.3% | Open | Not yet attempted |
 | 3 | Reduce kernel scales linearly with SPLIT_K | **Fixed algorithmically, not practically** | `kernel_splitk_v2` solves it in GPU-compute terms but loses to launch overhead in wall-clock terms; v1 remains the practical choice |
+
+## Experiment 2: decomposing the v1-vs-v2 wall-clock gap
+
+The v1-vs-v2 comparison above showed v2 losing on wall-clock latency despite
+winning on GPU compute time, attributed qualitatively to "launch overhead."
+This section isolates that claim into named, independently-measured
+components rather than leaving it as an inference.
+
+### Experiment 2a: pure kernel-launch dispatch cost
+
+Measured by launching a trivial (near-zero-work) Triton kernel N times
+back-to-back and fitting total latency vs. N (`experiment2_launch_overhead.py`).
+
+| N launches | Avg total (μs) | Per-launch (μs) |
+|---|---|---|
+| 1 | 9.08 | 9.08 |
+| 2 | 16.93 | 8.47 |
+| 4 | 32.33 | 8.08 |
+| 8 | 62.86 | 7.86 |
+| 16 | 119.28 | 7.46 |
+| 32 | 234.97 | 7.34 |
+
+Linear fit: `total_us ≈ 3.06 + 7.29 * n_launches`. Per-launch cost drops
+smoothly and stabilizes around **~7.3 μs**, consistent with a small
+one-time fixed cost plus a stable marginal dispatch cost per launch — this
+is the real, isolated, hardware/driver/PyTorch/Triton-stack cost of one
+additional kernel launch on this RTX 6000 Ada setup, independent of what
+the kernel actually computes.
+
+### Experiment 2b: intermediate-buffer allocation cost
+
+`kernel_splitk_v2` allocates three extra tensors (`m_final`, `l_final`,
+`acc_final`) that `kernel_splitk` (v1) does not need. Measured their
+allocation cost in isolation, with the same warmup convention used
+throughout this project (`experiment2b_allocation_overhead.py`):
+
+**Extra v2 allocation cost (properly warmed up): ~16.7 μs/iter**
+
+(Note: an earlier, unwarmed-up measurement showed ~238 μs — a red herring
+caused by the caching allocator's first-touch cost for a new shape, not
+representative of steady-state cost. Always warm up allocations of a given
+shape before timing, matching how the real benchmark scripts already warm
+up 10 iterations before every timed measurement.)
+
+### Putting it together
+
+| Component | Cost |
+|---|---|
+| 2 extra kernel launches (v2 has 4, v1 has 2) | ~14.6 μs (2 × 7.29 μs) |
+| 3 extra tensor allocations (v2-specific buffers) | ~16.7 μs |
+| **Combined predicted extra cost** | **~31.3 μs** |
+| **Actual measured v1-vs-v2 gap** (SPLIT_K=2/16/64) | **~43-45 μs** |
+
+Two independently-measured, named effects account for **~70%** of the
+actual gap. The remaining ~12-14 μs is an unexplained residual — plausibly
+Python-level overhead in `kernel_splitk_v2`'s wrapper (stride computation
+and argument marshaling across twice as many kernel launch calls) — noted
+here as acknowledged and not yet further decomposed, rather than chased to
+diminishing returns.
+
+**This upgrades the earlier qualitative claim ("launch overhead explains
+the gap") into a quantitative, partially-decomposed one**: kernel-launch
+dispatch and buffer allocation together account for the large majority of
+the measured wall-clock cost of v2's added parallelism, with a smaller,
+named-but-unexplained remainder. This is the evidence base for the planned
+atomic-counter single-launch redesign — a design that specifically
+eliminates both of the two *largest* named costs (extra launches AND extra
+intermediate allocations) simultaneously, rather than addressing either in
+isolation.
