@@ -575,3 +575,83 @@ kernel. See `docs/INFRASTRUCTURE_NOTES.md` for full diagnosis. The v3
 performance result above (wall-clock comparison + 1,400-trial stress test)
 is unaffected, since it relies on `nsys`/`torch.cuda.Event` timing, not
 `ncu`.
+
+## Bottleneck 2 investigation: shared memory footprint (in progress)
+
+Bottleneck 2 (per-block shared memory capping achieved occupancy at ~8.3%,
+identified in the original baseline profiling) was never addressed by v1,
+v2, or v3 — all three inherit the same per-block tile sizes for the
+forward-pass computation. Confirmed directly via Triton's compiled-kernel
+cache metadata (no `ncu` access was available in this session — see
+`docs/INFRASTRUCTURE_NOTES.md`):
+
+```bash
+cat ~/.triton/cache/<hash>/dsa_fwd_kernel_splitk_v3.json | python3 -m json.tool
+```
+
+"shared": 94976,
+"num_warps": 4,
+"num_stages": 3,
+
+
+**`shared: 94976` bytes is identical to the value measured for v1 in the
+original `ncu` profiling** (94.98 KB), confirming bottleneck 2 is present
+and unchanged in v3 — expected, since v3's per-block forward-pass math
+(tile shapes for `q_nope`, `k_ckv`, the `acc` accumulator, etc.) was not
+modified from `dsa_fwd_kernel_splitk`.
+
+### Attempted cheap fix: reducing num_stages
+
+`num_stages` controls how many pipeline stages Triton uses to overlap
+memory loads with compute (each stage typically needs its own buffered
+copy of load-destined tiles in shared memory, so naively, fewer stages
+should mean less shared memory usage). This required no kernel rewrite —
+just an overridable launch-time keyword argument
+(`test_num_stages_sweep.py`, launching `dsa_fwd_kernel_splitk_v3` directly
+with `num_stages` swept).
+
+**Result — counterintuitive and informative:**
+
+| num_stages | Result |
+|---|---|
+| 1 | **FAILED**: `OutOfResources: shared memory, Required: 116736, Hardware limit: 101376` |
+| 2 | 30.04 μs |
+| 3 (default) | 29.46 μs |
+| 4 | 30.19 μs |
+
+Two findings:
+1. **`num_stages=1` requires *more* shared memory (116,736 bytes) than the
+   default `num_stages=3` (94,976 bytes)** — the opposite of the naive
+   expectation. This suggests Triton's compiler does not scale shared
+   memory usage simply/linearly with `num_stages`; at very low stage
+   counts it likely falls back to a different code-generation strategy
+   (e.g., a non-double-buffered load pattern requiring different scratch
+   space) rather than simply allocating less memory. Not fully explained
+   without deeper inspection of Triton's compiler internals — noted
+   honestly as an open question rather than a resolved mechanism.
+2. **`num_stages = 2, 3, 4` are statistically indistinguishable in latency**
+   (30.04 / 29.46 / 30.19 μs — within normal run-to-run noise). `num_stages`
+   is not a meaningful lever for either memory footprint or performance on
+   this kernel.
+
+### Conclusion: the real cost is tile size, not pipelining depth
+
+Since `num_stages` doesn't move the needle, the ~95 KB shared memory
+requirement is coming from the **tile shapes themselves** — most likely
+the `BLOCK_D_CKV=512` dimension appearing simultaneously in multiple live
+tensors during the tensor-core `t1.dot` operations (the `acc` accumulator
+`[BLOCK_H=16, BLOCK_D_CKV=512]` in fp32, the `k_ckv` tile `[BLOCK_N,
+BLOCK_D_CKV]`, and `q_nope` `[BLOCK_H, BLOCK_D_CKV]`).
+
+**The next concrete step (not yet attempted): tile the `BLOCK_D_CKV=512`
+dimension itself** — instead of loading/accumulating the full 512-wide
+dimension per block, split it into sub-tiles (e.g. 2×256 or 4×128) and add
+an inner loop over sub-tiles, accumulating partial results the same way
+the existing KV loop already accumulates across `BLOCK_N` tiles. This is a
+structural change to the core per-block computation (not just the launch
+or reduction logic touched by v1/v2/v3), and is scoped as a separate,
+future piece of work — it should not be started casually at the end of a
+session, since it will need the same correctness rigor already applied
+elsewhere in this project (exact-match verification against `kernel()`,
+and likely a repeated-trial stress test if it introduces any new
+synchronization).
