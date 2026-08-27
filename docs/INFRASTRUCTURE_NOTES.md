@@ -101,3 +101,48 @@ conflict. Confirms this is a persistent lock on this node during this
 period, not a one-off timing fluke. Will retry again later (different
 session/time) or raise with cluster admins if it continues to block
 occupancy-comparison work.
+
+### Attempted fix: dcgmi profile --pause/--resume
+
+NVIDIA's own DCGM documentation (and HPC center guides, e.g. NERSC's
+Perlmutter docs) recommend `dcgmi profile --pause` before running `ncu`,
+then `dcgmi profile --resume` afterward, as the standard sanctioned
+workaround for exactly this conflict.
+
+```bash
+dcgmi profile --pause
+ncu --set basic --devices 0 -o ~/dsa_splitk_v3_ncu_test python profile_kernel_splitk_v3.py 16
+dcgmi profile --resume
+```
+
+**Result: both `dcgmi` commands reported success ("Successfully paused
+profiling." / "Successfully resumed profiling."), but `ncu` failed
+immediately afterward with the identical error**, even with the GPU
+device explicitly specified (`--devices 0`). This was reproduced twice.
+
+**Root cause hypothesis (unresolved without admin access):** `dcgmi`'s own
+output includes a warning on every invocation:
+
+WARNING: CUDA_VISIBLE_DEVICES is set to 0 on dcgmi process. This does not
+affect which GPUs are selected for diagnostics.
+...
+Status: Failed to get hostengine environment variable
+Please set the CUDA_VISIBLE_DEVICES env on nv-hostengine
+
+
+This suggests a device-context mismatch between the `dcgmi` client process
+(user-level) and the actual `nv-hostengine` daemon (running as root,
+system-wide — confirmed via `ps aux`/`systemctl status nvidia-dcgm`
+earlier in this document). If the client and daemon disagree about which
+GPU index corresponds to "device 0" — plausible on a shared SLURM node
+where per-job GPU allocation may not map 1:1 with DCGM's global device
+view — the `--pause` command may report success while not actually
+releasing the hardware counters for the specific GPU the job is using.
+
+**Conclusion: this is beyond what can be diagnosed or fixed from a user
+account.** The client-side pause/resume commands work as documented, but
+do not resolve the underlying conflict, which likely requires either
+pausing DCGM at the `nv-hostengine` level directly (root-only) or a
+cluster-side fix to GPU device-index mapping between SLURM job allocation
+and DCGM's device view. Raised with the department's technical support
+group; awaiting response.
