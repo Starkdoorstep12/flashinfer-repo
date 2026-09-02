@@ -676,3 +676,45 @@ redundant cost — `D_TILES`× more K-side loads/compute). Trade-off to be
 measured: does reduced peak accumulator memory (→ potentially better
 occupancy) outweigh the redundant K-side work? Not yet built or tested —
 scoped as the next concrete step.
+
+## Bottleneck 2, attempt 2: D-tiling with full-width K, tiled V (tested, made things worse)
+
+Built and tested a corrected D-tiling design: outer loop over D-tiles
+(one launch per D-tile, `D_TILE_ID` as a compile-time constant), full-width
+`qk`/softmax computation per KV-tile (since that's a reduction over the
+full 512-dim, independent of D-tiling), and only the V-side accumulation
+(`acc`) tiled to `TILE_D` width.
+
+**Result: `OutOfResources: shared memory, Required: 128000, Hardware
+limit: 101376`** — this configuration needs *more* shared memory
+(128,000 bytes) than the original untiled kernel (94,976 bytes), not less.
+
+**Root cause (identified by inspecting what's simultaneously live):** the
+original kernel loads `k_ckv` once per KV-tile and reuses that same tile
+for both its K role (in `qk_nope = q_nope @ k_ckv.T`) and its V role (in
+`acc += p @ k_ckv`) — implicit memory reuse via a single load. This
+D-tiling attempt splits that into two separate loads
+(`k_ckv_full`, full 512-wide, for K; `k_ckv_v`, TILE_D-wide, for V), both
+live simultaneously within the same loop iteration, alongside the
+still-full-width `q_nope`. The smaller accumulator (`[16, TILE_D]` instead
+of `[16, 512]`) does not compensate for the *duplicated* K-cache data now
+resident at once — net shared memory increases.
+
+**Conclusion: tiling only the V-side (output) dimension of the
+accumulator is not sufficient and actively counterproductive**, because it
+breaks the original kernel's single-load K/V reuse without replacing it
+with anything smaller. A design that actually reduces shared memory would
+need to tile the K-side reduction as well — accumulating `qk_nope` across
+D-sub-tiles the same way the existing KV-loop already accumulates across
+`BLOCK_N` tiles — restoring single-load reuse at the sub-tile level
+(load one `[BLOCK_N, TILE_D]` slice, use it for both a partial K-dot and
+a partial V-accumulation, then move to the next D-sub-tile). This is a
+larger, more invasive restructuring than either attempt made so far, and
+is the next candidate design, not yet built.
+
+Two tested attempts (this one and the earlier all-tiles-simultaneously-live
+version) are both documented here as negative results with concrete
+numbers, rather than left as unexplored hypotheses — both pointed toward
+the same conclusion: naive/partial tiling of this kernel's accumulator
+does not reduce shared memory without also restructuring the K-side
+reduction to preserve single-load K/V reuse at the sub-tile level.
