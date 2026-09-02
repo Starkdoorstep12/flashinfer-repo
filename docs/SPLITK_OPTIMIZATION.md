@@ -904,3 +904,72 @@ them** are the most likely dominant cost, and a design that tiles those
 more aggressively (while, per attempt 3's lesson, staying within a single
 kernel launch) is the remaining untested direction. Not yet attempted;
 noted as the state of this investigation for future work.
+
+## Bottleneck 2, attempt 5: decoupling BLOCK_N from SPLIT_K (occupancy doubled, no speedup)
+
+Re-examined data already collected earlier in this investigation: Triton's
+compiled metadata across different `SPLIT_K` values (originally checked
+only for compile-success, not systematically for shared memory) showed
+`BLOCK_N` — not the accumulator (attempt 4) or D-dimension tiling
+(attempts 1-3) — is the dominant driver of shared memory. `BLOCK_N=16`
+(previously only reachable at `SPLIT_K≥64`, via the existing adaptive
+formula `BLOCK_N = min(64, max(16, chunk_size // 2))`) compiles to just
+**37,568 bytes**, and `BLOCK_N=32` to exactly **51,200 bytes** — both
+crossing the threshold to unlock **2 blocks/SM (16.67% theoretical
+occupancy, double the 8.33% seen everywhere else this session)**.
+
+**The problem with the existing formula**: it only reaches small `BLOCK_N`
+at high `SPLIT_K`, exactly where the reduction step (even v3's improved
+single-launch design) has more per-token overhead. This conflates two
+independent variables that don't need to move together.
+
+**Fix**: added an optional `BLOCK_N` override parameter to
+`kernel_splitk_v3()`, decoupling K/V tile width from `SPLIT_K` entirely —
+allowing a good occupancy-driving `BLOCK_N` (16 or 32) to be paired with a
+`SPLIT_K` in the previously-established good operating range (8-32),
+rather than being forced together.
+
+**Result: correctness held (exact match) at every combination tested, but
+no meaningful wall-clock improvement.** `SPLIT_K=16` at `BLOCK_N=None`
+(default, 64), `32`, and `16` all landed within ~1.3μs of each other
+(60.77-61.52 μs) — statistically indistinguishable, despite the
+BLOCK_N=16/32 configurations having double the theoretical occupancy.
+Confirmed at additional `SPLIT_K` values (8, 32) with `BLOCK_N=16`: same
+result, no improvement (60.24-60.41 μs, matching the baseline range).
+
+**Interpretation — a genuinely informative negative result.** Theoretical
+occupancy improving did not translate into measured speedup. The most
+likely explanation: at this workload's scale (`num_tokens=1`,
+`SPLIT_K≤32` means at most 32 total blocks launched), the real constraint
+was never "too few blocks *per SM*" — it is "too few SMs used *at all*."
+With only 8-32 blocks launched across the GPU's 142 SMs, most SMs sit
+completely idle regardless of whether the handful of *active* SMs run 1 or
+2 blocks each. Doubling blocks-per-active-SM cannot compensate for the
+vast majority of SMs having zero work. This reframes bottleneck 2 as
+possibly not independently fixable via per-block resource tuning at all —
+the real lever for using more SMs is `SPLIT_K` itself (already explored:
+higher `SPLIT_K` fixes total-SM-utilization but costs more in the
+reduction step, per attempts and experiments earlier in this document),
+and per-block occupancy tuning (this attempt) operates on a different,
+apparently less binding, axis at this workload's scale.
+
+## Bottleneck 2: five attempts, investigation summary
+
+| Attempt | Idea | Shared mem | Occupancy | Wall-clock result |
+|---|---|---|---|---|
+| 1 | Tile accumulator, all live | No change (flawed) | N/A | Reverted before testing |
+| 2 | Full-width K, tiled V | 128,000 (worse) | 8.33% | Reverted (would be worse) |
+| 3 | Co-tiled K+V | 83,968 (better) | 8.33% (insufficient) | 1.28-2.29x slower (launch overhead) |
+| 4 | bf16 accumulator | 94,976 (no change) | 8.33% | No effect (correct, no benefit) |
+| 5 | Decouple BLOCK_N from SPLIT_K | 37,568-51,200 (best) | **16.67% (doubled)** | **No measurable speedup** |
+
+Five structurally different attempts, each understood precisely. Attempt 5
+is notable: it is the only one that genuinely doubled theoretical
+occupancy, yet produced no measured benefit — strong evidence that, at
+this specific workload scale, per-SM occupancy is not the binding
+constraint on performance, and total SM utilization (governed by grid
+size / `SPLIT_K`, already explored extensively via v1/v2/v3) is the real
+axis that matters. Bottleneck 2, as originally framed (per-block
+occupancy), may not be independently actionable for this workload without
+also revisiting the SPLIT_K-vs-reduction-cost tradeoff that governs total
+SM utilization.

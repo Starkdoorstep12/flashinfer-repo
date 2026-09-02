@@ -1105,7 +1105,7 @@ def dsa_fwd_kernel_splitk_v3_bf16acc(
         t1.store(lse_ptrs, lse_out)
 
 
-def kernel_splitk_v3(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, SPLIT_K=16):
+def kernel_splitk_v3(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, SPLIT_K=16, BLOCK_N=None):
     """
     Single-launch split-K variant using an atomic-counter synchronization
     gate ("last CTA does the reduction"). See module docstring above and
@@ -1134,7 +1134,16 @@ def kernel_splitk_v3(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scal
     counter = torch.zeros((num_tokens,), dtype=torch.int32, device=device)
 
     chunk_size = topk // SPLIT_K
-    BLOCK_N = min(64, max(16, chunk_size // 2))
+    # BLOCK_N controls the K/V tile width, which is the dominant driver of
+    # shared memory usage (see docs/SPLITK_OPTIMIZATION.md, Experiment 4:
+    # smaller BLOCK_N -> smaller pipelined K/V buffers -> lower shared mem
+    # -> potentially more blocks/SM). Previously derived only from
+    # SPLIT_K (forcing small BLOCK_N only at high SPLIT_K, where the
+    # reduction step is already degraded); now overridable independently
+    # so a good occupancy-driving BLOCK_N can be paired with a good
+    # reduction-step SPLIT_K.
+    if BLOCK_N is None:
+        BLOCK_N = min(64, max(16, chunk_size // 2))
 
     grid = (num_tokens, SPLIT_K)
     dsa_fwd_kernel_splitk_v3[grid](
