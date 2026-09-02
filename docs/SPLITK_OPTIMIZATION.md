@@ -846,3 +846,61 @@ finding a way to compute the K-side reduction more compactly (e.g.
 different tiling granularity, different precision, or restructuring the
 accumulator itself) rather than the "just split the loop" approaches tried
 so far. Not yet designed; noted as the honest state of this investigation.
+
+## Bottleneck 2, attempt 4: bf16 accumulator (tested, no meaningful effect)
+
+Hypothesis: the `[16, 512]` fp32 accumulator (`acc`) is a major contributor
+to the ~95KB shared memory footprint; halving its precision to bf16 during
+the KV loop (rescaling in fp32 to avoid compounding rounding error, then
+casting back to bf16 for loop-carried storage) should reduce it
+meaningfully. Built as `dsa_fwd_kernel_splitk_v3_bf16acc` /
+`kernel_splitk_v3_bf16acc`.
+
+**Implementation note**: an initial attempt hit a genuine Triton
+type-consistency error — `acc += t1.dot(...)` implicitly upcasts to fp32
+(tensor-core accumulation defaults to fp32 even with bf16 inputs), which
+violates Triton's requirement that a loop-carried variable's type stay
+constant across iterations. Fixed by making the upcast/downcast explicit:
+`acc = (acc.to(fp32) + t1.dot(...)).to(bf16)`.
+
+**Result: shared memory unchanged.** `94976` bytes — statistically
+identical to the original `94464/94976` baseline. Halving the
+accumulator's nominal size had no measurable effect on the compiled
+kernel's shared memory requirement.
+
+**Correctness held**: `max_abs_err = 0.015625` (one bf16 ULP) consistently
+across `SPLIT_K ∈ {2,4,8,16}` — expected, small, consistent with the
+bf16-rounding pattern seen throughout this project; no new bug.
+
+**Interpretation — a useful negative result**: this rules out the
+accumulator as the dominant contributor to shared memory usage, contrary
+to the working hypothesis. The real dominant cost is more likely the
+tiled K/V cache loads (`k_ckv`, `k_kpe`) combined with Triton's
+`num_stages=3` pipelining, which multiplies buffer requirements for
+double/triple-buffered memory-load overlap — consistent with the earlier
+`num_stages` experiment, which also pointed at pipelining/tile-load
+structure rather than the accumulator as the real driver, even though
+that experiment's own lever (stage count) didn't help either.
+
+## Bottleneck 2: four negative results, investigation status
+
+| Attempt | Idea | Shared mem result | Outcome |
+|---|---|---|---|
+| 1 | Tile accumulator only, all tiles live | No change (by design flaw, caught before testing) | Reverted |
+| 2 | Full-width K, tiled V | 128,000 bytes (worse) | Reverted |
+| 3 | Co-tiled K+V, single accumulator per D-tile | 83,968 bytes (best result, but tier-insufficient) | Kept, correct but slower (launch overhead) |
+| 4 | bf16 accumulator | 94,976 bytes (no change) | Kept, correct but no benefit |
+| — | Reduce num_stages | 116,736 bytes at num_stages=1 (worse) | Ruled out earlier |
+
+Four structurally different attempts have now been tried and precisely
+understood. The consistent finding across attempts 3 and 4 together is
+that **the accumulator and pipeline-stage-count are not the dominant
+shared-memory costs** — attempt 3's real reduction came specifically from
+eliminating the *full-width* K-cache load, not from touching the
+accumulator, and attempt 4 (touching only the accumulator) achieved
+nothing. This narrows the real target for any future attempt: **the K/V
+tile loads themselves and Triton's automatic pipelining buffers around
+them** are the most likely dominant cost, and a design that tiles those
+more aggressively (while, per attempt 3's lesson, staying within a single
+kernel launch) is the remaining untested direction. Not yet attempted;
+noted as the state of this investigation for future work.
