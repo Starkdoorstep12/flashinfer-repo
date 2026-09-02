@@ -1130,3 +1130,18 @@ saved load by a wide margin at high `SPLIT_K` — consistent with the
 broader pattern established throughout this investigation that sequential,
 per-iteration costs scale badly with `SPLIT_K`. Reverted; **v4 remains the
 best-performing, final design.**
+
+## num_warps sweep on v4 (untried parameter, no effect)
+
+Swept `num_warps ∈ {1,2,4,8,16}` on `kernel_splitk_v4` (never varied from
+the default 4 throughout this investigation). `num_warps=1,2` fail to
+compile (`OutOfResources`, shared memory — mirroring the same
+counterintuitive "fewer resources requested, more required" pattern seen
+earlier with `num_stages=1`, not fully explained). `num_warps=4,8,16` all
+land within noise of each other (61.42-62.80 μs), consistent with the
+~60-63μs plateau observed throughout this investigation regardless of
+which per-block resource parameter is varied. Correctness held at all
+compiling values. This is a fourth independent parameter (after
+`BLOCK_D_CKV` tiling, accumulator precision, and `BLOCK_N`) confirming the
+same conclusion: per-block resource tuning does not move performance for
+this kernel at this workload's scale.
