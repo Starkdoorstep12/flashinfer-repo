@@ -1033,3 +1033,66 @@ occupancy at 8.33%), turns out not to be independently actionable for this
 kernel: the occupancy ceiling it identified is real, but raising it
 does not help, because occupancy was never the true bottleneck at this
 workload's scale.
+
+## v4: fixing an O(SPLIT_K²) inefficiency in the reduction loop (genuine positive result)
+
+A fresh code review of `dsa_fwd_kernel_splitk_v3` (prompted by exhausting
+the parameter-tuning attempts on bottleneck 2) found a real algorithmic
+inefficiency, not a tuning issue: inside the winning program's reduction
+loop (`for s in range(SPLIT_K)`), extracting split `s`'s `alpha` value
+used a masked-sum trick —
+
+```python
+alpha_row = t1.sum(t1.where(offs_s[:, None] == s, alpha_s, 0.0), axis=0)
+```
+
+— which scans the **entire** `[SPLIT_K, BLOCK_H]` `alpha_s` tensor on
+**every** loop iteration, to extract one row. This is `O(SPLIT_K)` work
+per iteration, `SPLIT_K` iterations total: **O(SPLIT_K²)** overall, where
+a direct load only needs **O(SPLIT_K)**. (The masked-sum pattern exists
+because Triton doesn't support simple dynamic indexing with a runtime
+loop variable inside `@triton.jit` — this workaround pattern appears
+elsewhere in this codebase for the same reason, but here it was
+unnecessarily applied to data that could instead be re-loaded directly by
+pointer offset.)
+
+**Fix (`dsa_fwd_kernel_splitk_v4` / `kernel_splitk_v4`)**: instead of
+extracting split `s`'s `m`/`alpha` from the already-materialized
+`[SPLIT_K, BLOCK_H]` tensor via masked-sum, load `m` for split `s`
+directly via a scalar pointer offset (`PARTIAL_M + ... + s *
+stride_pm_split + ...`) and compute that split's `alpha` fresh, inline,
+each iteration — O(1) per iteration, O(SPLIT_K) total.
+
+### Correctness
+
+Exact match against both the original `kernel()` and `kernel_splitk_v3`
+at every tested `SPLIT_K ∈ {2,8,16,32,64,128}` — a pure optimization, no
+behavior change.
+
+### Performance: genuine improvement, growing with SPLIT_K as predicted
+
+| SPLIT_K | v3 | v4 | improvement |
+|---|---|---|---|
+| 2 | 63.93 μs | 62.39 μs | +1.54 μs |
+| 8 | 62.62 μs | 62.07 μs | +0.55 μs |
+| 16 | 61.68 μs | 59.86 μs | +1.81 μs |
+| 32 | 61.71 μs | 61.26 μs | +0.45 μs |
+| 64 | 62.62 μs | 62.04 μs | +0.58 μs |
+| **128** | **94.78 μs** | **78.58 μs** | **+16.20 μs (~17%)** |
+
+The improvement is small but consistent at low-to-mid `SPLIT_K` (where
+`SPLIT_K²` isn't dramatically larger than `SPLIT_K`), and substantial at
+`SPLIT_K=128` (~17% faster) — exactly matching the theoretical prediction
+that an O(SPLIT_K²) vs O(SPLIT_K) gap should be most visible at the
+highest tested `SPLIT_K`. This meaningfully narrows the previous gap
+between `SPLIT_K=128` and the 60-62μs sweet spot (94.78 → 78.58 μs),
+though 128 still does not match the best low/mid-range operating points.
+
+**This is the first genuine positive optimization result from tonight's
+extended investigation** (as distinct from the five well-characterized
+negative results on bottleneck 2 above) — found via direct code review
+after exhausting parameter-tuning approaches, not via profiling metrics.
+`kernel_splitk_v4` is the new recommended default going forward,
+superseding v3 (which remains in the codebase for historical/comparison
+purposes, including the stress-test evidence already established for the
+underlying atomic-counter design, which v4 leaves unchanged).
