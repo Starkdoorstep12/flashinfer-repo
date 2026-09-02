@@ -181,3 +181,61 @@ Triton currently applies); or capping/bucketing shapes into a small number
 of pre-compiled size classes (padding sequences up to the nearest bucket)
 to bound the number of distinct compiles needed, a common technique in
 production LLM serving systems for exactly this class of problem.
+
+## Finding 4 (critical): indexer_kernel is numerically INCORRECT against the golden reference
+
+Built a proper correctness test (`correctness_test_indexer.py`) using
+**real FP8-formatted data** matching the golden reference's exact
+expectations — `torch.float8_e4m3fn` queries, and a KV cache packed in
+the reference's documented per-page layout
+(`[fp8_data: page_size×128 bytes][scale_data: page_size×4 bytes]`).
+This is the first time this kernel has been tested against real-format
+data and a real golden reference — all prior testing tonight (and in
+earlier sessions) used loose `torch.randint(..., dtype=torch.int8)` random
+data that never matched the actual FP8 semantics or memory layout.
+
+**Result: severe mismatch.** Golden reference correctly selected 50/80
+valid top-k tokens (matching real `seq_len`) with proper `-1` padding for
+the remainder. Our kernel selected token index `0` for **all 2048**
+output slots on both tested batch elements — a degenerate, clearly wrong
+result (overlap with golden: 1/50 and 0/80 selected tokens respectively).
+
+**Root cause (suspected, not yet fully confirmed)**: the dequantization
+layout mismatch identified when first reading the golden reference (see
+above) — `indexer_kernel` assumes each token's FP8 values are immediately
+followed by that token's scale (`[fp8_128, scale_4]` interleaved per
+token), while the golden reference's documented layout is
+`[fp8_data for ALL tokens in page][scale_data for ALL tokens in page]`
+(blocked, not interleaved) — plus a different numeric interpretation
+(`k_tile.to(t1.float16)` naive cast vs. the reference's proper
+`float8_e4m3fn` bit-level decode). Corrupted/degenerate K values from
+this mismatch plausibly explain the "everything selects index 0" pattern:
+`topk_kernel`'s replace-the-minimum selection algorithm can degenerate to
+always picking the same (first-seen or tied) index when fed garbage or
+constant scores.
+
+**Status: NOT fixed.** This is a substantial, separate fix — correcting
+`indexer_kernel`'s pointer arithmetic and dequantization logic to match
+the golden reference's exact packed-block layout and proper FP8 decode —
+deserving its own careful design and testing pass, not attempted in this
+session. Flagged as the highest-priority next step for this track: **all
+prior findings in this document (compile-time scaling, the batch_size
+correctness fix) apply to a kernel that does not currently produce correct
+output**, so none of the performance numbers gathered so far can be
+trusted as representative of a working, correct system until this is
+fixed.
+
+## Updated summary
+
+| Finding | Status |
+|---|---|
+| 1. batch_size power-of-2 bug | Fixed and verified in isolation |
+| 2/3. Compile-time scaling (batch_size and MAX_SEQ_LEN) | Quantified |
+| **4. Dequantization layout mismatch — kernel produces wrong output** | **Confirmed broken, NOT fixed — highest priority** |
+
+**This reframes the whole indexer investigation**: findings 1-3 remain
+real and valid observations about this kernel's behavior, but Finding 4
+means the kernel is currently non-functional for its actual purpose. Any
+future work on this track should fix Finding 4 first, then re-verify
+findings 1-3 still hold (or re-measure them) against a kernel that
+actually produces correct output.
