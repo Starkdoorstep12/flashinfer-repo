@@ -135,3 +135,49 @@ track — unlike the attention track, which was checked against
 cleanly from Finding 2's compile cost using a warm cache; (c) if Finding 3
 proves to be a real, separable bottleneck, design and test a parallel
 top-K replacement.
+
+## Finding 2/3 update: compile time scales with MAX_SEQ_LEN, not just batch_size
+
+Isolated the compile-time cost specifically as a function of `MAX_SEQ_LEN`
+(the `constexpr` controlling `topk_kernel`'s `t1.static_range` unroll
+depth), holding `batch_size=4` fixed across both tests so any difference
+is attributable to sequence length alone, not batch size.
+
+| Case | seq_len | Cold compile time | Warm runtime |
+|---|---|---|---|
+| SHORT | 128 | 60.87s | 0.284 ms |
+| LONG | 5824 (matches real dataset max) | **167.20s** | not yet measured |
+
+**Compile time scales sub-linearly but substantially with `MAX_SEQ_LEN`**:
+a ~45x increase in sequence length (128 → 5824) produced only a ~2.75x
+increase in compile time (61s → 167s) — not exponential blowup, but a
+real, substantial absolute cost. Combined with Finding 2 (compile cost
+also scales independently with `batch_size` due to `constexpr`
+specialization), the two effects compound: a workload with both a new
+`batch_size` *and* a new `MAX_SEQ_LEN` not previously seen could plausibly
+approach or exceed **~3-4 minutes of cold-compile latency** before any
+actual computation happens.
+
+**Framing this finding correctly**: this is a compile-time cost, not a
+runtime cost — importantly different from a kernel simply being "slow."
+Once compiled and cached, this kernel's warm runtime is fast (0.284ms for
+the SHORT case, consistent with typical GPU kernel latencies). In a real
+serving system, this cost would normally be paid once per unique shape
+via ahead-of-time warmup, not per-request — the same principle
+`flashinfer-bench`'s own evaluation methodology applies (separate warmup
+and timed phases). **The actual finding is not "this kernel is slow" but
+"this kernel's compile-time specialization strategy (baking `batch_size`
+and `MAX_SEQ_LEN` in as Triton `constexpr`s) does not scale gracefully to
+the shape diversity seen in this track's realistic dataset** (18 distinct
+batch sizes, sequence lengths spanning at least 1 to 5824+ tokens observed)
+— a real engineering/deployment concern distinct from, and arguably more
+interesting than, a simple runtime-speed bottleneck.
+
+**Candidate fix directions** (not yet attempted): making `MAX_SEQ_LEN`
+and/or `batch_size` runtime values rather than compile-time constants
+(likely requires restructuring `t1.static_range` loops to regular runtime
+loops, at a possible cost to the aggressive unroll-based optimization
+Triton currently applies); or capping/bucketing shapes into a small number
+of pre-compiled size classes (padding sequences up to the nearest bucket)
+to bound the number of distinct compiles needed, a common technique in
+production LLM serving systems for exactly this class of problem.
