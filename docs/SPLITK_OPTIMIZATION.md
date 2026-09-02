@@ -655,3 +655,24 @@ session, since it will need the same correctness rigor already applied
 elsewhere in this project (exact-match verification against `kernel()`,
 and likely a repeated-trial stress test if it introduces any new
 synchronization).
+
+## Bottleneck 2, attempt 1: D-tiling (reverted, design corrected for next attempt)
+
+A first attempt at tiling `BLOCK_D_CKV` (splitting the accumulator into
+smaller sub-tiles to reduce shared memory) was built and found to have a
+flawed design: all D-tiles of the accumulator were updated within the same
+KV-tile loop, meaning they all stayed simultaneously live for the entire
+loop duration — no actual reduction in peak memory versus one full-width
+accumulator. Reverted before committing (net-zero diff after cleanup).
+
+**Corrected design for next attempt:** `qk` computation and softmax
+bookkeeping (`m_i`, `l_i`, `p`) are a reduction over the full 512-dim and
+do not need to be tiled — they're independent of how the *output*
+accumulator is tiled. Only the V-side accumulation (`acc += p @ k_ckv`)
+needs tiling. Correct structure: outer loop over D-tiles, inner loop over
+KV-tiles, recomputing `qk`/`p` per D-tile (small, cheap — only `[BLOCK_H,
+BLOCK_N]`) but reloading the full-width `k_ckv` as K each time (the actual
+redundant cost — `D_TILES`× more K-side loads/compute). Trade-off to be
+measured: does reduced peak accumulator memory (→ potentially better
+occupancy) outweigh the redundant K-side work? Not yet built or tested —
+scoped as the next concrete step.
