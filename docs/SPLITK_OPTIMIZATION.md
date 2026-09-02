@@ -718,3 +718,63 @@ numbers, rather than left as unexplored hypotheses — both pointed toward
 the same conclusion: naive/partial tiling of this kernel's accumulator
 does not reduce shared memory without also restructuring the K-side
 reduction to preserve single-load K/V reuse at the sub-tile level.
+
+## Generalization across dataset workload shapes (num_tokens 1-8)
+
+All profiling and optimization work so far used a single workload
+(`uuid=0c23b10c...`, `num_tokens=1`) — the worst case for grid-size
+underutilization, but not representative of every workload in the actual
+benchmark dataset. Checked the full dataset's shape distribution: across
+all 23 workloads, `num_tokens` ranges from 1 to 8 (`num_pages` fixed at
+8462 throughout). This matters because the *original* kernel's grid is
+`(num_tokens,)` — at `num_tokens=8`, the original kernel already launches
+8 blocks on its own, a meaningfully different starting point than the
+single-block `num_tokens=1` case the entire v1/v2/v3 investigation was
+built around.
+
+**Test**: one representative workload per distinct `num_tokens` value
+(1, 2, 6, 7, 8), comparing `kernel()` [original], `kernel_splitk` (v1), and
+`kernel_splitk_v3` (v3) at `SPLIT_K=16` for both correctness and wall-clock
+performance (`sweep_workloads.py`).
+
+| num_tokens | err (v1) | err (v3) | orig | v1 | v3 | v1 speedup | v3 speedup |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.000000 | 0.000000 | 96.75 μs | 68.21 μs | 59.96 μs | 1.42x | 1.61x |
+| 2 | 0.000000 | 0.000000 | 96.63 μs | 68.69 μs | 60.19 μs | 1.41x | 1.61x |
+| 6 | 0.003906 | 0.003906 | 96.95 μs | 68.33 μs | 60.21 μs | 1.42x | 1.61x |
+| 7 | 0.007812 | 0.007812 | 96.91 μs | 68.61 μs | 61.44 μs | 1.41x | 1.58x |
+| 8 | 0.007812 | 0.007812 | 96.97 μs | 67.18 μs | 59.94 μs | 1.44x | 1.62x |
+
+**Correctness**: exact match at `num_tokens=1,2`; small non-zero errors
+appear at `num_tokens=6,7,8` (0.0039-0.0078), but well within the bf16
+rounding tolerance established for this project (golden-reference checks
+throughout used `atol=rtol=1e-2`). Critically, **v1 and v3 show identical
+error at every `num_tokens` value** — v3 introduces no additional
+numerical drift beyond what v1 already has; the small discrepancy is
+consistent between both split-K variants, consistent with normal
+floating-point accumulation-order differences as more tokens/heads are
+processed, not a version-specific bug.
+
+**Performance: remarkably flat across the entire num_tokens range.** The
+original kernel's latency does not measurably change from `num_tokens=1`
+to `8` (96.6-97.0 μs throughout) — going from 1 to 8 blocks is still far
+below the GPU's 142 SMs, so neither end of this range is meaningfully less
+occupancy-starved in practice. v1 and v3's speedups are correspondingly
+stable across the same range (v1: 1.41-1.44x; v3: 1.58-1.62x), with no
+sign of the benefit fading, reversing, or requiring workload-adaptive
+tuning within this dataset's shape range.
+
+**Conclusion: split-K's benefit generalizes across the full range of
+workload shapes present in this benchmark's dataset.** A single fixed
+`SPLIT_K=16` performs consistently well from `num_tokens=1` through `8`,
+answering the open question raised earlier in this document (whether
+`SPLIT_K` needs to be workload-adaptive) — for this dataset's shape range,
+it does not.
+
+**Scope limitation, stated explicitly:** this generalization claim is
+bounded by the dataset actually available — `num_tokens` here only goes up
+to 8. It should not be read as claiming split-K remains beneficial at much
+larger token/batch counts (e.g., 64, 128+), where the original kernel's
+own grid size might eventually become large enough on its own to reduce
+or eliminate the underutilization problem split-K addresses. Untested
+beyond this dataset's range.
