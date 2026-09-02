@@ -75,9 +75,23 @@ required careful attention to memory-ordering semantics (the counter is a
 synchronization gate, not a pure accumulator, so it needs `acq_rel`
 atomics, not `relaxed`) and, given the concurrency risk, was validated
 with a 1,400-trial stress test (not just a single passing run) before being
-trusted. **v3 beats both v1 and v2 at every measured `SPLIT_K`** —
-typically 10-15% faster than v1 in the normal operating range, and by a
-much wider margin at high `SPLIT_K` where v1 degrades.
+trusted. v3 beats both v1 and v2 at every measured `SPLIT_K` — typically
+10-15% faster than v1 in the normal operating range, and by a much wider
+margin at high `SPLIT_K` where v1 degrades.
+
+**v4 (final, recommended default): fixed an O(SPLIT_K²) inefficiency in
+v3's reduction loop.** A direct code review (after exhausting five
+parameter-tuning attempts on bottleneck 2 below) found that v3's inline
+reduction extracted each split's value via a masked-sum scan over the
+entire `[SPLIT_K, BLOCK_H]` tensor, once per split — O(SPLIT_K²) work
+where O(SPLIT_K) suffices. Fixing this via direct pointer-offset loads is
+a pure optimization (verified exact-match correctness against both the
+golden reference and v3): negligible difference at low `SPLIT_K`, and a
+~17% improvement at `SPLIT_K=128` (94.78 → 78.58 μs). A further attempt
+(v5, replacing v4's remaining redundant load with a fully sequential
+streaming reduction) was tested and found decisively worse — v4's
+parallel hardware max reduction is more valuable than the load it costs —
+confirming **v4 as the final design**, superseding v3.
 
 See `SPLITK_OPTIMIZATION.md` for full design details, the Triton
 synchronization research behind v3, and the complete v1/v2/v3 performance
@@ -138,6 +152,6 @@ static analysis of Triton's compiled-kernel metadata rather than live
 
 | Bottleneck | Status |
 |---|---|
-| 1. Grid-size underutilization | **Fixed** (v1/v3, ~1.4-1.6x end-to-end speedup, generalizes across dataset) |
+| 1. Grid-size underutilization | **Fixed** (v1/v3/v4, ~1.4-1.6x end-to-end speedup, generalizes across dataset; v4 is the final recommended kernel) |
 | 2. Per-block shared memory / occupancy | **Investigated to completion** — 5 attempts + closing sweep establish this is not the true bottleneck at this workload's scale |
 | 3. Reduction step launch/allocation overhead | **Fixed** (v3, stress-tested for correctness) |
