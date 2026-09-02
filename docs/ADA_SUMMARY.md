@@ -96,19 +96,30 @@ is explicitly scoped to the dataset's actual range (`num_tokens` ≤ 8); it
 is not claimed to hold at much larger token counts, which this dataset
 does not contain.
 
-## Open work
+## Bottleneck 2: investigated to completion, found not independently actionable
 
-**Bottleneck 2 (per-block shared memory, capping occupancy at ~8.3%,
-unchanged by v1/v2/v3) remains unresolved.** Two tiling attempts were
-built and tested, both unsuccessful, each for a precisely understood
-reason (see `SPLITK_OPTIMIZATION.md`): naively tiling only the
-accumulator doesn't reduce peak memory since all tiles stay simultaneously
-live; tiling only the output (V-side) dimension while leaving the K-side
-reduction full-width is actively counterproductive, since it duplicates
-K-cache residency instead of reducing it. The next candidate design tiles
-both the K-side reduction and V-side accumulation together at the
-sub-tile level, restoring the original kernel's single-load K/V reuse —
-not yet built.
+**Bottleneck 2 (per-block shared memory, capping occupancy at ~8.3% in
+the original baseline) was investigated exhaustively across five
+structurally distinct attempts, plus a closing sweep, and found NOT to be
+the true performance constraint at this workload's scale.**
+
+1. Tiling only the accumulator: no memory reduction (design flaw, caught before testing).
+2. Tiling only the V-side (output) dimension: shared memory *increased* (94,976 -> 128,000 bytes) by duplicating K-cache residency.
+3. Co-tiling both K-side and V-side: shared memory genuinely reduced (83,968 bytes) but insufficient to change the occupancy tier, and the multi-launch design cost more in launch/HBM overhead than it saved.
+4. bf16 accumulator: no effect on shared memory at all (94,976 bytes unchanged) — ruled out the accumulator as the dominant cost.
+5. Decoupling `BLOCK_N` from `SPLIT_K`: found `BLOCK_N` (not the accumulator or D-tiling) is the real dominant driver of shared memory, and reducing it genuinely doubles theoretical occupancy (8.33% -> 16.67%, shared memory down to 37,568-51,200 bytes) — **but produced no measurable wall-clock speedup anywhere in the practical `SPLIT_K` range**, and actively hurt at very low `SPLIT_K` (pure loop-overhead cost with no offsetting benefit).
+
+**Conclusion**: at this workload's scale (`num_tokens` 1-8, `SPLIT_K` in
+the tens before reduction-step overhead dominates), per-block/per-SM
+occupancy is not the binding constraint — most of the GPU's 142 SMs sit
+idle regardless of how many blocks run per *active* SM. The real
+constraint is **total SM utilization**, governed by `SPLIT_K` itself,
+which trades directly against reduction-step cost — a tradeoff already
+deeply characterized via the v1/v2/v3 arc above. This is a complete,
+evidence-based finding, not an abandoned investigation: the original
+`ncu`-flagged occupancy ceiling was real, but raising it does not help,
+because occupancy was never the true bottleneck for this kernel at this
+scale.
 
 ## Infrastructure limitation, noted for completeness
 
@@ -128,5 +139,5 @@ static analysis of Triton's compiled-kernel metadata rather than live
 | Bottleneck | Status |
 |---|---|
 | 1. Grid-size underutilization | **Fixed** (v1/v3, ~1.4-1.6x end-to-end speedup, generalizes across dataset) |
-| 2. Per-block shared memory / occupancy | Open — two negative results narrow the next design |
+| 2. Per-block shared memory / occupancy | **Investigated to completion** — 5 attempts + closing sweep establish this is not the true bottleneck at this workload's scale |
 | 3. Reduction step launch/allocation overhead | **Fixed** (v3, stress-tested for correctness) |
