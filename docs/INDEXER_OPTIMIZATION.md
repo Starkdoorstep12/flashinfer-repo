@@ -239,3 +239,64 @@ means the kernel is currently non-functional for its actual purpose. Any
 future work on this track should fix Finding 4 first, then re-verify
 findings 1-3 still hold (or re-measure them) against a kernel that
 actually produces correct output.
+
+## Finding 5 (fixed): topk_kernel had two separate bugs, both now fixed
+
+After fixing Finding 4's dequantization (both K-side layout/decode and a
+previously-unnoticed identical bug on the Q-side, which had no FP8 cast
+at all), scores matched the golden reference to floating-point precision.
+The remaining mismatch was isolated entirely to `topk_kernel`'s selection
+logic, which had two independent bugs:
+
+**Bug 5a: tie-breaking in the replace-the-minimum selection.**
+`top_scores` initializes all `K` slots to the identical sentinel `-1e9`.
+The original `is_min = top_scores == min_val` matches **every** tied slot
+simultaneously, not just one — on the very first real token processed,
+every one of the `K=2048` slots (all still at the initial sentinel) gets
+overwritten with that single token's score in one step, corrupting the
+entire top-k buffer immediately. Fixed by selecting only the
+lowest-index slot among ties (`t1.min(t1.where(is_min, offs_k, MAX_K))`)
+before constructing the replace mask, guaranteeing exactly one slot is
+ever updated per token.
+
+**Bug 5b: physical vs. logical index-space mismatch.** The golden
+reference's output indices are **physical KV-cache page addresses**
+(`page_idx * page_size + offset_in_page`, from `dequant_fp8_kv_cache`'s
+paged layout). `indexer_kernel` internally indexes `acc_ptr` (and
+therefore `topk_kernel`'s `top_indices`) by **logical, sequence-relative
+position** (`seq_start + offset_token` — position within the concatenated
+batch of sequences). These are different address spaces that only
+coincidentally agree for a single-page sequence whose page happens to be
+page 0. Fixed by converting each selected logical position back to a
+physical page address inside `topk_kernel` before storing, using
+`block_table` (passed in as a new parameter): recover the sequence-local
+offset, derive `page_id`/`offset_in_page`, look up the physical page via
+`block_table`, and reconstruct `physical_page * page_size + offset_in_page`.
+
+**Verification**: `correctness_test_indexer.py`, using real
+`float8_e4m3fn`-formatted data matching the golden reference's exact
+input format — **both test batches now match exactly**: batch 0
+(single-page, `seq_len=50`): 50/50 overlap; batch 1 (multi-page,
+`seq_len=80`, spanning 2 pages): 80/80 overlap.
+
+## Final summary: all four findings now resolved for correctness
+
+| Finding | Status |
+|---|---|
+| 1. batch_size power-of-2 bug | **Fixed** |
+| 2/3. Compile-time scaling (batch_size, MAX_SEQ_LEN) | Quantified (not a correctness issue; a deployment/engineering cost) |
+| 4. Dequantization mismatch (K-side layout + Q-side missing cast) | **Fixed** |
+| 5. topk_kernel: tie-breaking bug + physical/logical index mismatch | **Fixed** |
+
+The indexer kernel (`run_indexer_and_topk`) is now verified numerically
+correct against the golden reference for both single-page and
+multi-page sequences. Compile-time scaling (Findings 2/3) remains an
+open engineering concern, distinct from correctness, worth revisiting
+for production deployment but not blocking correctness verification.
+
+**Next**: run a broader stress test across more batch sizes and sequence
+length combinations (including non-power-of-2 batch sizes, per Finding 1)
+to confirm the fix generalizes, then re-time the corrected kernel's
+compile and runtime cost (Findings 2/3's numbers were gathered before
+these correctness fixes and should be re-confirmed still hold, since
+correctness fixes could in principle change performance characteristics).

@@ -176,37 +176,58 @@ def indexer_kernel(
    # -------------------------------------------------------
    # LOAD K TILE
    # -------------------------------------------------------
+   # CORRECTED LAYOUT (per the golden reference's dequant_fp8_kv_cache):
+   # each page is packed as [fp8_data: page_size*index_head_dim bytes]
+   # followed by [scale_data: page_size*4 bytes] -- FP8 values for ALL
+   # tokens come first (stride = index_head_dim per token, NOT
+   # head_dim_with_scale), then all per-token float32 scales in a
+   # separate trailing block. The original code assumed an interleaved
+   # per-token [fp8_128, scale_4] layout, which does not match the real
+   # deep_gemm packed format and produced numerically wrong K values
+   # (confirmed via correctness_test_indexer.py against the golden
+   # reference -- see docs/INDEXER_OPTIMIZATION.md, Finding 4).
    k_ptrs = (
        k_page_ptr
-       + (offset_in_page + offs_t)[:, None] * head_dim_with_scale
+       + (offset_in_page + offs_t)[:, None] * index_head_dim
        + offs_d[None, :]
    )
 
 
-   k_tile = t1.load(
+   # Raw bytes are int8 (reinterpreted as uint8 per the reference); each
+   # byte IS one float8_e4m3fn value bit-for-bit, so we bitcast rather
+   # than numerically convert.
+   k_tile_raw = t1.load(
        k_ptrs,
        mask=token_mask[:, None],
        other=0
    )
+   k_tile_fp8 = t1.cast(k_tile_raw, t1.float8e4nv, bitcast=True)
+   k_tile = k_tile_fp8.to(t1.float32)
 
 
-   # Dummy fetch scale (not used for dequantization in FP16)
-   scale_ptrs = (
-       k_page_ptr
-       + (offset_in_page + offs_t) * head_dim_with_scale
-       + index_head_dim
-   )
+   # Scale block starts after all FP8 data in the page; one float32
+   # (4 bytes) per token, reinterpreted via bitcast from the 4 raw bytes
+   # rather than numerically converted. Loaded as 4 separate 1D loads
+   # (Triton does not support indexing a single column out of a 2D
+   # tensor the way scale_bytes[:, i] would require).
+   scale_block_start = page_size * index_head_dim
+   scale_base_ptrs = k_page_ptr + scale_block_start + (offset_in_page + offs_t) * 4
 
+   sb0 = t1.load(scale_base_ptrs + 0, mask=token_mask, other=0)
+   sb1 = t1.load(scale_base_ptrs + 1, mask=token_mask, other=0)
+   sb2 = t1.load(scale_base_ptrs + 2, mask=token_mask, other=0)
+   sb3 = t1.load(scale_base_ptrs + 3, mask=token_mask, other=0)
 
-   scale_vals = t1.load(
-       scale_ptrs,
-       mask=token_mask,
-       other=0.0
-   )
+   b0 = t1.cast(sb0, t1.uint8).to(t1.int32)
+   b1 = t1.cast(sb1, t1.uint8).to(t1.int32)
+   b2 = t1.cast(sb2, t1.uint8).to(t1.int32)
+   b3 = t1.cast(sb3, t1.uint8).to(t1.int32)
+   scale_int32 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+   scale_vals = t1.cast(scale_int32, t1.float32, bitcast=True)
 
 
    # Dequantize FP8 values using per-token scales
-   k_vals = k_tile.to(t1.float16) * scale_vals[:, None]
+   k_vals = k_tile * scale_vals[:, None]
 
 
    # -------------------------------------------------------
@@ -233,11 +254,20 @@ def indexer_kernel(
        )
 
 
-       q_block = t1.load(
+       q_block_raw = t1.load(
            q_ptrs,
            mask=(offs_d[:, None] < index_head_dim) & (h_ids[None, :] < num_index_heads),
-           other=0.0
+           other=0
        )
+       # q_index_fp8 is real float8_e4m3fn data (raw int8 bytes); must bitcast
+       # rather than numerically convert, same fix as applied to the K-side
+       # dequantization above. This was previously loaded with other=0.0 and
+       # no cast at all, implicitly treating raw FP8 bit patterns as if they
+       # were already meaningful float values -- confirmed via
+       # debug_indexer_scores.py as a second, independent source of the score
+       # mismatch found in Finding 4 (docs/INDEXER_OPTIMIZATION.md).
+       q_block_fp8 = t1.cast(q_block_raw, t1.float8e4nv, bitcast=True)
+       q_block = q_block_fp8.to(t1.float32)
        q_block = t1.trans(q_block) # this is just for correcting math
    # ---------------------------------------------
    # LOAD WEIGHTS [BLOCK_HEADS]
@@ -299,11 +329,14 @@ def topk_kernel(
    acc_ptr,
    seq_offsets,
    seq_lens,
+   block_table,
    topk_indices_ptr,
    K: t1.constexpr,
    MAX_K: t1.constexpr,
    BLOCK: t1.constexpr,
-   MAX_SEQ_LEN: t1.constexpr
+   MAX_SEQ_LEN: t1.constexpr,
+   page_size: t1.constexpr,
+   max_num_pages: t1.constexpr
 ):
     batch_id = t1.program_id(0)
 
@@ -340,15 +373,46 @@ def topk_kernel(
             # check if new value should enter top-k
             cond = valid & (v > min_val)
 
-            # replace the min element
+            # BUG FIX: top_scores can have MULTIPLE slots tied at the
+            # current minimum (e.g. all K slots start at -1e9, so on the
+            # very first real token EVERY slot matches is_min and would
+            # get overwritten simultaneously, corrupting the whole top-k
+            # buffer in one step -- confirmed via correctness_test_indexer.py
+            # against the golden reference, see docs/INDEXER_OPTIMIZATION.md
+            # Finding 5). Break ties by only replacing the FIRST (lowest
+            # array-index) slot that matches the minimum, using an argmin
+            # via a one-hot mask on the position of the first True in
+            # is_min, rather than replacing every tied slot at once.
             is_min = top_scores == min_val
+            # position of first True in is_min (lowest index among ties)
+            first_min_pos = t1.min(t1.where(is_min, offs_k, MAX_K), axis=0)
+            replace_mask = cond & (offs_k == first_min_pos)
 
-            top_scores = t1.where(cond & is_min, v, top_scores)
-            top_indices = t1.where(cond & is_min, idx, top_indices)
+            top_scores = t1.where(replace_mask, v, top_scores)
+            top_indices = t1.where(replace_mask, idx, top_indices)
+
+    # BUG FIX (Finding 5, docs/INDEXER_OPTIMIZATION.md): top_indices holds
+    # LOGICAL sequence-relative positions (from acc_ptr's indexing, i.e.
+    # seq_start + offset_token), but the golden reference expects PHYSICAL
+    # page addresses (page_idx * page_size + offset_in_page). These are
+    # different index spaces that only coincidentally agree for
+    # single-page sequences allocated at page 0. Convert here using
+    # block_table before storing.
+    is_valid_idx = top_indices != -1
+    local_offset = t1.where(is_valid_idx, top_indices - seq_start, 0)
+    page_id = local_offset // page_size
+    offset_in_page = local_offset % page_size
+    physical_page = t1.load(
+        block_table + batch_id * max_num_pages + page_id,
+        mask=is_valid_idx,
+        other=0,
+    )
+    physical_addr = physical_page * page_size + offset_in_page
+    top_indices_physical = t1.where(is_valid_idx, physical_addr, -1)
 
     # store result
     out_offs = batch_id * K + t1.arange(0, K)
-    t1.store(topk_indices_ptr + out_offs, top_indices)
+    t1.store(topk_indices_ptr + out_offs, top_indices_physical)
 
 def run_indexer_and_topk(
     q_index_fp8,
@@ -431,11 +495,14 @@ def run_indexer_and_topk(
         acc_ptr=acc,
         seq_offsets=seq_offsets,
         seq_lens=seq_lens,
+        block_table=block_table,
         topk_indices_ptr=topk_indices,
         K=topk,
         MAX_SEQ_LEN=MAX_SEQ_LEN,
         BLOCK=16,
         MAX_K=topk,   # static upper bound
+        page_size=page_size,
+        max_num_pages=max_num_pages,
     )
 
     return topk_indices
