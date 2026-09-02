@@ -778,3 +778,71 @@ larger token/batch counts (e.g., 64, 128+), where the original kernel's
 own grid size might eventually become large enough on its own to reduce
 or eliminate the underutilization problem split-K addresses. Untested
 beyond this dataset's range.
+
+## Bottleneck 2, attempt 3: co-tiled K-side and V-side (tested, correct, but slower)
+
+Built the theoretically correct design: both the K-side reduction
+(computing `qk_nope`) and the V-side accumulation (`acc`) tiled over
+`BLOCK_D_CKV`, each looping over `D_TILES` sub-tiles independently, never
+holding a full-width `[*, 512]` tensor at any point
+(`dsa_fwd_kernel_splitk_dtiled_v3` / `kernel_splitk_dtiled_v3`).
+
+**Shared memory: genuinely reduced.** Confirmed via Triton's compiled
+metadata: `shared` dropped from 94,976 bytes (original/v1/v3) to **83,968
+bytes** — an ~11.6% real reduction, and the first attempt in this series
+that actually lowered the footprint rather than increasing it (contrast
+attempt 2's 128,000 bytes).
+
+**But occupancy tier unchanged.** Using the manual CUDA occupancy formula
+(no `ncu` required — see `INFRASTRUCTURE_NOTES.md` for why `ncu` access
+was unavailable this session): `102400 // 83968 = 1` block/SM, identical
+to `102400 // 94976 = 1`. To reach 2 blocks/SM would require shared memory
+≤ 51,200 bytes — roughly half of what this design achieves. **Theoretical
+occupancy remained exactly 8.33% in both cases.**
+
+**Correctness: verified.** Exact match (`max_abs_err = 0.000000`) against
+`kernel()` across `SPLIT_K ∈ {2,4,8,16}` × `D_TILES ∈ {2,4}` (8
+combinations, all passing).
+
+**Performance: worse than v1 in every configuration tested**, and worse
+in proportion to `D_TILES`:
+
+| SPLIT_K | D_TILES=2 | D_TILES=4 |
+|---|---|---|
+| 2 | 1.34x slower | 2.29x slower |
+| 4 | 1.28x slower | 1.99x slower |
+| 8 | 1.36x slower | 1.93x slower |
+| 16 | 1.35x slower | 2.02x slower |
+
+**Root cause, connecting back to earlier findings:** this design pays two
+real costs without an offsetting occupancy benefit. (1) The K-side
+reduction now reloads `k_ckv` from HBM a second time (once per D-sub-tile,
+in a separate pass from the V-side reload) — genuine extra memory
+traffic that the original single-load design avoided. (2) The
+`kernel_splitk_dtiled_v3` wrapper launches `dsa_fwd_kernel_splitk_dtiled_v3`
+once per `D_TILE_ID` (i.e., `D_TILES` separate kernel launches instead of
+one) — at `D_TILES=4`, that is 4 launches where v1 needs 1, and per
+Experiment 2's measured ~7.3μs/launch marginal cost plus the general
+finding that launch/allocation overhead dominates at this kernel's
+timescale, this alone predicts a substantial slowdown, independent of any
+memory-traffic cost. The result — degradation scaling directly with
+`D_TILES` — is consistent with launch overhead being the dominant term,
+the same mechanism that made v2 lose to v1.
+
+**Conclusion: bottleneck 2 remains open, and this line of attack (tiling
+the accumulator/reduction dimension while adding kernel launches) is now
+tested exhausted with three consecutive negative results, each understood
+precisely:**
+1. Attempt 1: no memory reduction (all tiles simultaneously live) — caught before testing.
+2. Attempt 2: memory *increased* (duplicated K-cache residency).
+3. Attempt 3: memory reduced (~11.6%) but insufficient to change occupancy tier, while adding launch and HBM-traffic overhead that made wall-clock performance worse.
+
+**Implication for any future attempt**: a design that could plausibly work
+would need to (a) achieve a much larger memory reduction — enough to
+actually cross the 51,200-byte threshold to 2 blocks/SM — while (b) doing
+so within a **single kernel launch** (no extra launches per D-tile,
+learning directly from why attempt 3 and v2 both lost). This likely means
+finding a way to compute the K-side reduction more compactly (e.g.
+different tiling granularity, different precision, or restructuring the
+accumulator itself) rather than the "just split the loop" approaches tried
+so far. Not yet designed; noted as the honest state of this investigation.
