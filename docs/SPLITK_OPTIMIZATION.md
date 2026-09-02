@@ -973,3 +973,63 @@ axis that matters. Bottleneck 2, as originally framed (per-block
 occupancy), may not be independently actionable for this workload without
 also revisiting the SPLIT_K-vs-reduction-cost tradeoff that governs total
 SM utilization.
+
+## Bottleneck 2, closing check: full SPLIT_K sweep with BLOCK_N=16 forced
+
+To exhaust the investigation, swept the full `SPLIT_K` range
+(`2, 4, 8, 16, 32, 64, 128`) comparing the default (`SPLIT_K`-derived)
+`BLOCK_N` against `BLOCK_N=16` forced at every point, not just where it
+was already the default (`closing_check_bottleneck2.py`).
+
+| SPLIT_K | BLOCK_N=default | BLOCK_N=16 (forced) | err |
+|---|---|---|---|
+| 2 | 61.35 μs | **109.25 μs** | 0.000000 |
+| 4 | 59.84 μs | 59.19 μs | 0.000000 |
+| 8 | 59.38 μs | 58.72 μs | 0.000000 |
+| 16 | 59.70 μs | 60.11 μs | 0.000000 |
+| 32 | 60.57 μs | 59.71 μs | 0.000000 |
+| 64 | 59.91 μs | 59.56 μs | 0.000000 |
+| 128 | 94.76 μs | 94.40 μs | 0.000000 |
+
+**Correctness held everywhere** (exact match at every point).
+
+**One clear outlier explains itself and reinforces the conclusion**: at
+`SPLIT_K=2`, forcing `BLOCK_N=16` nearly doubles latency (61.35 → 109.25
+μs) relative to the default. At `SPLIT_K=2`, `chunk_size=1024`, so the
+default `BLOCK_N` (64, derived) means 16 KV-loop iterations, while forcing
+`BLOCK_N=16` quadruples that to 64 iterations for the *same* total work —
+pure loop-overhead cost (index computation, masking, per-iteration `t1.dot`
+call overhead) with no compensating benefit, since at `SPLIT_K=2` only 2
+SMs are used regardless of per-SM occupancy. This is a clean illustration
+of the same principle established in attempt 5: **`BLOCK_N` reduction only
+has a plausible payoff when total-SM-utilization is already reasonably
+high; at very low `SPLIT_K`, shrinking `BLOCK_N` is pure cost with no
+occupancy benefit worth having.**
+
+**Every other point (SPLIT_K=4 through 128) is statistically flat
+regardless of BLOCK_N** — confirming attempt 5's finding holds robustly
+across the entire practical range, not just the handful of points tested
+earlier. This closes the investigation: doubling per-SM occupancy via
+`BLOCK_N` does not produce a measurable benefit anywhere in this
+workload's practical operating range, and can actively hurt at the low end
+of `SPLIT_K` where it adds pure loop overhead.
+
+## Bottleneck 2: final conclusion
+
+Five structurally distinct fixes attempted, one closing sweep exhausting
+the parameter space of the most promising lever (attempt 5's `BLOCK_N`
+decoupling). **The consistent, final finding: per-block/per-SM occupancy
+is not the binding performance constraint for this kernel at the
+workload scale present in this dataset** (`num_tokens` 1-8, meaning
+`SPLIT_K` in the tens at most before reduction-step overhead dominates).
+The real, already-well-characterized constraint remains **total SM
+utilization**, governed by `SPLIT_K` itself, which trades off directly
+against reduction-step cost (v1's sequential merge scales with `SPLIT_K`;
+v3's atomic-counter design mitigates but does not eliminate this
+tradeoff). This is not a failure to find a fix — it is a complete,
+evidence-based characterization of why bottleneck 2, as originally framed
+by the baseline `ncu` profiling (which flagged shared-memory-limited
+occupancy at 8.33%), turns out not to be independently actionable for this
+kernel: the occupancy ceiling it identified is real, but raising it
+does not help, because occupancy was never the true bottleneck at this
+workload's scale.
