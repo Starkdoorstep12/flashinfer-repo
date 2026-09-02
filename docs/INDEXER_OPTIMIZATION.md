@@ -300,3 +300,40 @@ to confirm the fix generalizes, then re-time the corrected kernel's
 compile and runtime cost (Findings 2/3's numbers were gathered before
 these correctness fixes and should be re-confirmed still hold, since
 correctness fixes could in principle change performance characteristics).
+
+## Generalization: verified against 7 real dataset workloads
+
+Extended correctness verification beyond the two hand-built test cases to
+7 real workloads pulled directly from the dataset
+(`stress_test_indexer_dataset.py`), spanning `batch_size ∈ {1, 2, 3, 4, 12,
+15}` — including three non-power-of-2 values (3, 12, 15), directly
+exercising Finding 1's fix — and selected-token counts up to 2611,
+exercising the dequantization (Finding 4) and index-space conversion
+(Finding 5) fixes at real scale rather than toy cases.
+
+**Result: 7/7 workloads passed with exact overlap** (every selected token
+in our output exactly matches the golden reference's selection, for every
+workload tested):
+
+| UUID | batch_size | power of 2 | overlap/golden | ours |
+|---|---|---|---|---|
+| 30cecff1 | 1 | yes | 2/2 | 2 |
+| 44ddaa65 | 1 | yes | 129/129 | 129 |
+| b2098949 | 2 | yes | 140/140 | 140 |
+| 4279d75e | 4 | yes | 1194/1194 | 1194 |
+| 83cb81c5 | 3 | **no** | 160/160 | 160 |
+| 1ece7fb3 | 15 | **no** | 1831/1831 | 1831 |
+| 70d53807 | 12 | **no** | 2611/2611 | 2611 |
+
+This is strong, dataset-grounded confirmation that all four fixes
+(Findings 1, 4, 5a, 5b) generalize correctly, not just for the two
+narrow synthetic cases used during debugging.
+
+**Remaining open item**: Findings 2/3 (compile-time scaling) were
+measured before these correctness fixes landed. The fixes changed the
+kernel's internal logic (added `block_table` loads and physical-address
+conversion inside `topk_kernel`) but did not change any `constexpr`
+parameters (`batch_size`, `MAX_SEQ_LEN` are still compile-time constants)
+— so the compile-time scaling behavior is expected to be qualitatively
+unchanged, though not yet re-measured on the corrected kernel to confirm
+this quantitatively.
