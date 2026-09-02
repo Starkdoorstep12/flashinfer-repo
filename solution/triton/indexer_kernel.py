@@ -105,7 +105,15 @@ def indexer_kernel(
    # Determine batch_id without using 'break'
    # Find the first batch where pid is less than its tile_offset
    # This effectively means finding the index 'b' where tile_offsets_ptr[b-1] <= pid < tile_offsets_ptr[b]
-   batch_id = t1.sum(t1.cast(pid >= t1.load(tile_offsets_ptr + t1.arange(0, batch_size)), t1.int32))
+   # batch_size may not be a power of 2 (confirmed with real dataset
+   # workloads: e.g. batch_size=15 is common), but t1.arange requires a
+   # power-of-2 range. Pad up to the next power of 2 and mask out the
+   # padded entries so they don't corrupt the batch_id computation.
+   batch_size_padded: t1.constexpr = triton.next_power_of_2(batch_size)
+   offs_b = t1.arange(0, batch_size_padded)
+   b_mask = offs_b < batch_size
+   tile_offsets_padded = t1.load(tile_offsets_ptr + offs_b, mask=b_mask, other=2**30)
+   batch_id = t1.sum(t1.cast(pid >= tile_offsets_padded, t1.int32))
 
 
    prev_offset = t1.where(
