@@ -1096,3 +1096,37 @@ after exhausting parameter-tuning approaches, not via profiling metrics.
 superseding v3 (which remains in the codebase for historical/comparison
 purposes, including the stress-test evidence already established for the
 underlying atomic-counter design, which v4 leaves unchanged).
+
+## v5 (attempted, reverted): sequential streaming reduction loses to v4's parallel max
+
+After v4's win, tried one further refinement: replace v4's remaining
+inefficiency (loading `m` twice — once in a vectorized pre-pass for
+`m_final`, once again per-iteration for `alpha`) with a single-pass
+streaming online-softmax merge across splits, mirroring the same
+running-max/running-sum pattern already used for merging KV-tiles in the
+main loop.
+
+**Correctness held** (exact match vs. both `kernel()` and `kernel_splitk_v4`
+at every `SPLIT_K` tested).
+
+**Performance: decisively worse**, especially at high `SPLIT_K`:
+
+| SPLIT_K | v4 | v5 | diff |
+|---|---|---|---|
+| 2 | 61.46 μs | 60.99 μs | +0.47 μs |
+| 8 | 60.96 μs | 60.86 μs | +0.09 μs |
+| 16 | 61.85 μs | 62.39 μs | -0.54 μs |
+| 32 | 62.55 μs | 62.48 μs | +0.07 μs |
+| **64** | **60.49 μs** | **89.99 μs** | **-29.49 μs** |
+| 128 | 78.49 μs | 89.72 μs | -11.23 μs |
+
+**Conclusion**: v4's parallel hardware max reduction
+(`t1.max(m_split, axis=0)` over the full `[SPLIT_K, BLOCK_H]` tensor) is
+substantially more valuable than avoiding its one redundant memory load.
+v5's sequential running-max (one comparison per split) trades that
+parallel reduction for `SPLIT_K` sequential steps, and the cost of
+sequentializing what was a single vectorized operation outweighs the
+saved load by a wide margin at high `SPLIT_K` — consistent with the
+broader pattern established throughout this investigation that sequential,
+per-iteration costs scale badly with `SPLIT_K`. Reverted; **v4 remains the
+best-performing, final design.**

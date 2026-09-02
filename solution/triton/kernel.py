@@ -1112,7 +1112,6 @@ def dsa_fwd_kernel_splitk_v4(
         t1.store(lse_ptrs, lse_out)
 
 
-
 @triton.jit
 def dsa_fwd_kernel_splitk_v3_bf16acc(
     Q_NOPE, Q_PE, CKV_CACHE, KPE_CACHE, SPARSE_INDICES,
@@ -1623,3 +1622,5 @@ def kernel_splitk_v4(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scal
     )
 
     return output, lse
+
+
