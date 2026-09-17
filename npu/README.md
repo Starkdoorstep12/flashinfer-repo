@@ -1,39 +1,28 @@
-# NPU Benchmarking (Planned — Not Yet Started In This Repo)
+# NPU Benchmarking Track
 
-This directory is a placeholder for a fifth benchmarking axis alongside
-the four GPUs covered elsewhere in this repo (RTX 6000 Ada, A100, L40S,
-DGX Spark/Blackwell): a Qualcomm Hexagon NPU.
+Fifth benchmarking axis alongside the four GPUs covered elsewhere in this
+repo (RTX 6000 Ada, A100, L40S, DGX Spark/Blackwell): a Qualcomm Hexagon
+NPU, via the Lenovo ThinkCentre Neo 50q QC (Snapdragon X1-26-100).
 
-## Motivation
+## Contents
 
-Exploring an NPU target alongside the GPU work as a less-saturated,
-higher-novelty angle than a GPU-only kernel optimization comparison for
-the MLSys 2026 submission.
-
-## Hardware and toolchain
-
-- **Device**: Lenovo ThinkCentre Neo 50q QC (Snapdragon X1-26-100),
-  Hexagon NPU, rated up to 45 TOPS. Provided by the advisor as separate
-  hardware for this axis.
-- **OS**: Windows 11 Pro.
-- **Toolchain**: Qualcomm QAIRT/QNN SDK, Python 3.12 ARM64,
-  onnxruntime-qnn. Confirmed working: the toolchain detects and can
-  target the Hexagon NPU device.
-- All NPU-side development happens on the ThinkCentre itself — the
-  QAIRT/QNN SDK and NPU execution do not run on the primary dev laptop
-  (Intel i7-10510U, no NPU). Code developed there will be synced into
-  this directory once it exists.
-
-## Current blocker
-
-`QcSoCServiceUtils.dll` (a Qualcomm/Lenovo OEM driver DLL) crashes with a
-stack-overflow-class exception whenever a tool queries SoC/device info on
-the HTP/NPU path. Reproduced in both `qnn-platform-validator.exe` and an
-onnxruntime-qnn `InferenceSession` targeting the NPU device. A Lenovo
-firmware update did not resolve it. Not yet fixed.
+- `onnx_export_indexer.py` — static-shape, masked rewrite of the top-k
+  indexer's golden reference (`golden_indexer_reference.run()`) for ONNX
+  export compatibility (ONNX requires fixed shapes; the original has
+  per-batch dynamic top-k/seq_len). Validated exact match against the
+  golden reference on both test batches (50/50, 80/80).
+- `indexer.onnx` — the exported model.
+- `run_npu_indexer_export.py`, `run_on_gpu_test.py`, `run_on_npu.py` —
+  execution scripts for running the exported model via onnxruntime-qnn on
+  the NPU/GPU execution providers.
+- `NPU_BLOCKER.md` — current blocker: `QcSoCServiceUtils.dll` crashes on
+  QNN device init for both NPU and GPU targets. The export pipeline
+  itself is verified working; the crash is isolated to QNN
+  device-targeted execution on this specific hardware/driver. See that
+  file for the full stack trace and diagnosis.
 
 ## Status
 
-No code or environment setup has been committed to this repo yet — all
-work so far has happened directly on the ThinkCentre. This file exists so
-the planned scope is visible in the repo ahead of that work landing here.
+Export and validation complete. Blocked on the QNN device-init crash
+before any actual on-device NPU execution/benchmarking can happen — see
+`NPU_BLOCKER.md`.
