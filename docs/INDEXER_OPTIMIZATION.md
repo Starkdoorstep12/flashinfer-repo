@@ -337,3 +337,67 @@ parameters (`batch_size`, `MAX_SEQ_LEN` are still compile-time constants)
 — so the compile-time scaling behavior is expected to be qualitatively
 unchanged, though not yet re-measured on the corrected kernel to confirm
 this quantitatively.
+
+## Shape bucketing: reducing compile count for realistic serving scale
+
+Motivated by Findings 2/3 (compile-time scaling), implemented shape
+bucketing: `run_indexer_and_topk_bucketed` rounds `batch_size` and
+`max_num_pages` up to the next power of 2 before compiling, padding
+inputs with masked dummy entries, then slices the real batch back out of
+the padded output. This bounds the number of distinct compiles needed to
+`O(log(max_batch) × log(max_pages))` instead of one compile per unique
+shape ever seen.
+
+**Real dataset impact**: across all 128 workloads in the indexer
+dataset, every workload has a distinct `(batch_size, max_num_pages)` pair
+— 128 unique compiles required without bucketing. With power-of-2
+bucketing, these collapse into **28 distinct compiled shapes** — a
+**4.6x reduction** in the total number of cold compiles needed to cover
+the entire dataset.
+
+**Correctness**: verified exact match against the unbucketed
+`run_indexer_and_topk` across the same 7 representative real workloads
+used in `stress_test_indexer_dataset.py` (`correctness_test_bucketed.py`)
+— 7/7 pass, identical top-k selections.
+
+### Investigated: a rare, intermittent CUDA error during multi-workload measurement
+
+While measuring bucketing's real-world timing benefit across a larger
+(30-workload) sample, encountered an intermittent
+`RuntimeError: Triton Error [CUDA]: an illegal memory access was
+encountered`, always at the same point in dataset order (after the first,
+smallest workload — `batch_size=1, max_num_pages=1, seq_lens=[2]` —
+followed by the second). Investigated thoroughly before concluding:
+
+- **30/30 fresh-process trials** of the exact failing two-workload
+  sequence, without forced synchronization: 0 failures
+  (`stress_test_carryover.py`).
+- **20/20 fresh-process trials** of the same sequence **with**
+  `torch.cuda.synchronize()` forced after each workload (matching the
+  exact pattern that triggered the original failure in the measurement
+  script): 0 failures.
+- **`CUDA_LAUNCH_BLOCKING=1`** (forces fully synchronous kernel
+  execution, which should make a genuine deterministic bug reproduce
+  every time): did not reproduce the failure.
+- **`compute-sanitizer --tool memcheck`** (out-of-bounds/misaligned
+  memory access detection), run with a cleared Triton cache to force
+  genuine re-instrumented compilation (confirmed by realistic ~58s
+  per-workload timing under the sanitizer, ruling out a silent no-op
+  run): **0 errors**.
+- **`compute-sanitizer --tool initcheck`** (uninitialized memory read
+  detection — the category of bug most consistent with an
+  intermittent, input-independent failure pattern), same
+  cache-cleared/re-instrumented setup: **0 errors**.
+
+**Conclusion**: across ~50+ combined trials and two independent,
+properly-engaged CUDA memory-safety tools, this failure reproduced only
+twice, both times inside the same longer-running 30-workload measurement
+script, never in isolation. This pattern is consistent with a rare,
+transient environmental fault (e.g. shared-GPU contention or a driver
+hiccup on the Turing cluster — a category of issue already documented
+elsewhere in this project, see `INFRASTRUCTURE_NOTES.md`) rather than a
+deterministic bug in `run_indexer_and_topk` or the bucketing wrapper.
+Not treated as evidence requiring a code fix; handled defensively in
+measurement scripts via per-workload exception handling (logging and
+excluding any failed iteration from timing totals) rather than papering
+over a suspected real bug.

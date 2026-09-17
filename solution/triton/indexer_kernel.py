@@ -570,3 +570,97 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale):
         output[t] = out.to(torch.bfloat16)
 
     return output, lse
+
+
+def _next_pow2(n):
+    p = 1
+    while p < n:
+        p *= 2
+    return p
+
+
+def run_indexer_and_topk_bucketed(
+    q_index_fp8: torch.Tensor,
+    k_index_cache_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    batch_size: int,
+    num_index_heads: int,
+    index_head_dim: int,
+    page_size: int,
+    kv_cache_num_heads: int,
+    head_dim_with_scale: int,
+    max_num_pages: int,
+    topk: int,
+    BLOCK_TOKENS: int = 32,
+    BLOCK_HEADS: int = 8,
+):
+    """
+    Shape-bucketed wrapper around run_indexer_and_topk. batch_size and
+    max_num_pages are rounded up to the next power of 2 (padding inputs
+    with masked-out dummy entries), so that many real workloads sharing
+    the same bucket reuse a single compiled kernel instead of each
+    triggering its own independent compile. See
+    docs/INDEXER_OPTIMIZATION.md, "Bucketing" section: on the real
+    dataset (128 workloads), this reduces distinct compiles needed from
+    128 (one per workload) to 28 -- a 4.6x reduction.
+
+    MAX_SEQ_LEN (topk_kernel's outer-loop bound) is derived from the
+    BUCKETED max_num_pages, not the real seq_lens.max(), so the compiled
+    shape depends only on the bucket, not the exact real sequence length.
+    Positions beyond each sequence's real length are already masked out
+    by the existing seq_lens-based validity checks in both kernels, so
+    this only costs extra (masked, non-contributing) loop iterations, not
+    incorrect results -- this is the padding-waste side of the tradeoff.
+    """
+    device = q_index_fp8.device
+
+    bucketed_batch_size = _next_pow2(batch_size)
+    bucketed_max_num_pages = _next_pow2(max_num_pages)
+
+    # Pad batch dimension
+    if bucketed_batch_size > batch_size:
+        pad_b = bucketed_batch_size - batch_size
+        seq_lens_p = torch.cat([seq_lens, torch.zeros(pad_b, dtype=seq_lens.dtype, device=device)])
+        q_index_fp8_p = torch.cat([q_index_fp8, torch.zeros((pad_b,) + tuple(q_index_fp8.shape[1:]), dtype=q_index_fp8.dtype, device=device)])
+        weights_p = torch.cat([weights, torch.zeros((pad_b,) + tuple(weights.shape[1:]), dtype=weights.dtype, device=device)])
+        block_table_p = torch.cat([block_table, torch.zeros((pad_b, block_table.shape[1]), dtype=block_table.dtype, device=device)])
+    else:
+        seq_lens_p = seq_lens
+        q_index_fp8_p = q_index_fp8
+        weights_p = weights
+        block_table_p = block_table
+
+    # Pad page dimension
+    if bucketed_max_num_pages > block_table_p.shape[1]:
+        pad_p = bucketed_max_num_pages - block_table_p.shape[1]
+        block_table_p = torch.cat(
+            [block_table_p, torch.zeros((block_table_p.shape[0], pad_p), dtype=block_table_p.dtype, device=device)],
+            dim=1,
+        )
+
+    seq_offsets_p = torch.cat([torch.tensor([0], device=device), seq_lens_p.cumsum(0)[:-1]]).to(torch.int32)
+
+    padded_out = run_indexer_and_topk(
+        q_index_fp8=q_index_fp8_p,
+        k_index_cache_fp8=k_index_cache_fp8,
+        weights=weights_p,
+        seq_lens=seq_lens_p,
+        block_table=block_table_p,
+        seq_offsets=seq_offsets_p,
+        batch_size=bucketed_batch_size,
+        num_index_heads=num_index_heads,
+        index_head_dim=index_head_dim,
+        page_size=page_size,
+        kv_cache_num_heads=kv_cache_num_heads,
+        head_dim_with_scale=head_dim_with_scale,
+        max_num_pages=bucketed_max_num_pages,
+        topk=topk,
+        BLOCK_TOKENS=BLOCK_TOKENS,
+        BLOCK_HEADS=BLOCK_HEADS,
+    )
+
+    # Slice back down to the real batch_size, discarding padded rows.
+    return padded_out[:batch_size]
