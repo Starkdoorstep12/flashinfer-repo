@@ -550,3 +550,77 @@ entirely regardless of its root cause.
    potential win than bucketing's 1.53x, on a completely different
    (algorithmic, not compile-time) axis. This is a separate, real
    optimization opportunity worth its own investigation.
+
+## Finding 6 (fixed): topk_kernel_qrita was missing Finding 5b's physical/logical index conversion entirely
+
+As part of evaluating SOTA top-k alternatives for the paper (comparing
+against Qrita, arXiv:2602.01518, implemented in `topk_kernel_qrita` /
+`compute_topk_qrita`), built `correctness_test_qrita.py` to compare its
+output against the already golden-reference-verified `topk_kernel`.
+Initial runs showed near-total mismatches across every batch except
+batch 0, which is exactly the signature of a Finding-5b-style bug
+recurring in new code.
+
+**Root cause**: `topk_kernel_qrita` never received Finding 5b's fix.
+Both its fast path (`seq_len <= K`) and general path (ternary-search
+pivot selection) stored raw sequence-local offsets (`offs_n`) directly
+into `TOPK_INDICES`, with no `block_table`/`page_size` conversion to
+physical page addresses at all — the kernel didn't even take
+`block_table` as a parameter. `topk_kernel`'s output, by contrast, is
+physical addresses (`page_idx * page_size + offset_in_page`) since
+Finding 5b. Batch 0 passed by pure coincidence (page 0, offset 0 is
+identity under the conversion), masking the bug everywhere it didn't
+apply.
+
+**Fix**: added `BLOCK_TABLE`, `page_size`, `max_num_pages` as kernel
+parameters; applied the same physical-address conversion used in
+`topk_kernel` before every store, in both the fast path and general
+path:
+
+```python
+page_id = offs_n // page_size
+offset_in_page = offs_n % page_size
+physical_page = t1.load(
+    BLOCK_TABLE + row_id * max_num_pages + page_id,
+    mask=mask_n, other=0,
+)
+physical_addr = physical_page * page_size + offset_in_page
+```
+
+Updated `compute_topk_qrita`'s signature to accept and pass through
+`block_table`, `page_size`, `max_num_pages` to match.
+
+**A secondary, unrelated harness bug** was also found and fixed along
+the way: `correctness_test_qrita.py` called `topk_kernel` directly with
+non-power-of-2 `topk` values (e.g. `topk=50`), which fails Finding 1's
+`t1.arange` power-of-2 constraint on `K`. No existing caller in the
+codebase does this — `run_indexer_and_topk` always receives `topk=2048`
+from the golden-reference spec (`assert topk == 2048`), so this
+constraint had never been exercised with an arbitrary value before.
+Fixed by using power-of-2 `topk` values (64) in the test's general-path
+and fast-path cases; the real-dataset-scale cases already used
+`topk=2048`.
+
+**Verification**: after both fixes, all 13 batches across all 4 test
+cases (general path, fast path, mixed, real-dataset-scale — spanning
+`seq_len` from 2 to 5824) matched `topk_kernel`'s selection exactly
+(100% overlap). The general path's ternary-search pivot logic itself
+(tie-breaking via `min_larger`/`num_min_larger`) required no changes —
+the fix was entirely in the index-encoding step downstream of
+selection, confirming the selection algorithm itself was already
+correct.
+
+| Test | Batches | Result |
+|---|---|---|
+| T1 (general path, seq_len 100-500) | 3/3 | Exact match |
+| T2 (fast path, seq_len 2-10) | 3/3 | Exact match |
+| T3 (mixed, seq_len 10-3000) | 4/4 | Exact match |
+| T4 (real dataset scale, seq_len 2-5824) | 4/4 | Exact match |
+
+**Status**: `topk_kernel_qrita` is now correctness-verified as a valid
+SOTA baseline for the paper's comparison. Next: performance comparison
+against `topk_kernel` at real scale, and folding this into a broader
+stress test (`stress_test_indexer_dataset.py`-style, real dataset
+workloads) before treating this as fully generalized, given how much
+the bug was masked by batch-0-always-passing in the initial hand-picked
+test cases.

@@ -664,3 +664,218 @@ def run_indexer_and_topk_bucketed(
 
     # Slice back down to the real batch_size, discarding padded rows.
     return padded_out[:batch_size]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Qrita-inspired top-k: ternary pivot search instead of replace-the-minimum
+# scan, adapted from vLLM's production Triton implementation
+# (vllm/v1/sample/ops/topk_topp_triton.py, based on Park et al.,
+# "Qrita: High-performance Top-k and Top-p using Pivot-based Truncation
+# and Selection", arXiv:2602.01518).
+#
+# Key adaptations from the original (which masks a dense [batch, vocab]
+# logits tensor in-place):
+#   - Outputs INDICES (topk_indices[batch, topk]), not masked values,
+#     since the sparse attention kernel needs actual positions.
+#   - Variable per-row seq_len (via seq_offsets), not a fixed VOCAB_SIZE,
+#     since sequences have different lengths (paged KV cache).
+#   - Fixed topk=2048 (compile-time constant), not a per-row runtime k.
+#   - Grid-strided across batch (for row_id in range(pid, batch_size,
+#     num_programs)) using min(num_sm, batch_size) programs, adapted
+#     directly from the vLLM source -- this is the actual grid-
+#     parallelism fix motivating this port (analogous to the
+#     grid-underutilization fix, "bottleneck 1", in the sparse attention
+#     kernel work).
+#   - This first version omits Qrita's Gaussian sigma-truncation
+#     optimization (searches the full row directly via ternary search
+#     rather than first narrowing to a small outlier buffer) -- a
+#     simplification to verify core correctness first; the truncation
+#     optimization can be layered in afterward if this baseline is
+#     correct and its performance profile justifies it.
+# ═══════════════════════════════════════════════════════════════════════════
+
+@triton.jit
+def _update_min_larger_stats(data, above_mask, min_larger, num_min_larger, sentinel):
+    """Update running (min, count) of values above a pivot across tiles.
+    Adapted from vLLM's topk_topp_triton.py (Qrita reference implementation).
+    Tracks the smallest value strictly above a pivot and how many times
+    it occurs, merged across tiles."""
+    tile_min = t1.min(t1.where(above_mask, data, sentinel))
+    tile_eq = above_mask & (t1.abs(data - tile_min) < 1e-9)
+    tile_cnt = t1.sum(tile_eq.to(t1.int32))
+    is_new = tile_min < min_larger
+    is_same = t1.abs(tile_min - min_larger) < 1e-9
+    num_min_larger = t1.where(is_new, tile_cnt, num_min_larger + tile_cnt * is_same)
+    min_larger = t1.minimum(min_larger, tile_min)
+    return min_larger, num_min_larger
+
+
+@triton.jit
+def topk_kernel_qrita(
+    ACC,             # [total_tokens] float32, flat concatenated scores
+    SEQ_OFFSETS,     # [batch_size] int32, cumulative offset per sequence
+    SEQ_LENS,        # [batch_size] int32
+    BLOCK_TABLE,     # [batch_size, max_num_pages] int32
+    TOPK_INDICES,    # [batch_size, K] int32 output
+    BATCH_SIZE,      # runtime int, number of sequences
+    K: t1.constexpr,
+    BLOCK_SIZE: t1.constexpr,
+    page_size: t1.constexpr,
+    max_num_pages: t1.constexpr,
+):
+    pid = t1.program_id(0)
+    num_programs = t1.num_programs(0)
+
+    for row_id in range(pid, BATCH_SIZE, num_programs):
+        seq_start = t1.load(SEQ_OFFSETS + row_id)
+        seq_len = t1.load(SEQ_LENS + row_id)
+        ACC_ROW = ACC + seq_start
+
+        NUM_TILES = (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+
+        # Fast path: if seq_len <= K, every token is selected -- no
+        # search needed. This is exactly the degenerate case TensorRT-LLM
+        # identified as warranting a dedicated bypass (seq_len <= topk).
+        if seq_len <= K:
+            for i in range(0, NUM_TILES):
+                offs_n = i * BLOCK_SIZE + t1.arange(0, BLOCK_SIZE)
+                mask_n = offs_n < seq_len
+                page_id = offs_n // page_size
+                offset_in_page = offs_n % page_size
+                physical_page = t1.load(
+                    BLOCK_TABLE + row_id * max_num_pages + page_id,
+                    mask=mask_n, other=0,
+                )
+                physical_addr = physical_page * page_size + offset_in_page
+                out_ptrs = TOPK_INDICES + row_id * K + offs_n
+                t1.store(out_ptrs, physical_addr.to(t1.int32), mask=mask_n)
+            # Remaining K - seq_len slots are left as -1, via the
+            # Python wrapper pre-filling TOPK_INDICES with -1 before launch.
+        else:
+            # General path: ternary search for the k-th largest value (pivot).
+            max_val = -float("inf")
+            min_val = float("inf")
+            for i in range(0, NUM_TILES):
+                offs_n = i * BLOCK_SIZE + t1.arange(0, BLOCK_SIZE)
+                mask_n = offs_n < seq_len
+                vals = t1.load(ACC_ROW + offs_n, mask=mask_n, other=-float("inf"))
+                max_val = t1.maximum(max_val, t1.max(vals))
+                vals_for_min = t1.load(ACC_ROW + offs_n, mask=mask_n, other=float("inf"))
+                min_val = t1.minimum(min_val, t1.min(vals_for_min))
+
+            min_range = min_val
+            max_range = max_val
+            pivot = min_range
+            num_iters = 0
+            found = 0
+            min_larger = float("inf")
+            num_min_larger = t1.zeros((), dtype=t1.int32)
+            k_count = t1.zeros((), dtype=t1.int32)
+
+            while found == 0:
+                pivot_0 = (max_range - min_range) / 3.0 + min_range
+                pivot_1 = (max_range - min_range) * 2.0 / 3.0 + min_range
+                cnt_0 = t1.zeros((), dtype=t1.int32)
+                cnt_1 = t1.zeros((), dtype=t1.int32)
+                ml_0 = float("inf")
+                nml_0 = t1.zeros((), dtype=t1.int32)
+                ml_1 = float("inf")
+                nml_1 = t1.zeros((), dtype=t1.int32)
+
+                for i in range(0, NUM_TILES):
+                    offs_n = i * BLOCK_SIZE + t1.arange(0, BLOCK_SIZE)
+                    mask_n = offs_n < seq_len
+                    vals = t1.load(ACC_ROW + offs_n, mask=mask_n, other=-float("inf"))
+                    above_0 = (vals > pivot_0) & mask_n
+                    above_1 = (vals > pivot_1) & mask_n
+                    cnt_0 += t1.sum(above_0.to(t1.int32))
+                    cnt_1 += t1.sum(above_1.to(t1.int32))
+                    ml_0, nml_0 = _update_min_larger_stats(vals, above_0, ml_0, nml_0, float("inf"))
+                    ml_1, nml_1 = _update_min_larger_stats(vals, above_1, ml_1, nml_1, float("inf"))
+
+                if (cnt_0 >= K) and (cnt_0 - nml_0 < K):
+                    pivot = pivot_0
+                    k_count = cnt_0
+                    min_larger = ml_0
+                    num_min_larger = nml_0
+                    found = 1
+                if (cnt_1 >= K) and (cnt_1 - nml_1 < K):
+                    pivot = pivot_1
+                    k_count = cnt_1
+                    min_larger = ml_1
+                    num_min_larger = nml_1
+                    found = 1
+
+                if cnt_1 > K:
+                    min_range = pivot_1
+                elif cnt_0 > K:
+                    min_range = pivot_0
+                if cnt_0 < K:
+                    max_range = pivot_0
+                elif cnt_1 < K:
+                    max_range = pivot_1
+
+                num_iters += 1
+                if (num_iters >= 30) or (t1.abs(max_range - min_range) < 1e-9):
+                    pivot = (max_range + min_range) / 2.0
+                    min_larger = ml_0
+                    num_min_larger = nml_0
+                    found = 1
+
+            # num_keep: how many of the "duplicate" (tied-at-min_larger)
+            # values to actually keep, to hit exactly K total.
+            num_keep = num_min_larger - (k_count - K)
+            num_kept = t1.zeros((), dtype=t1.int32)
+            write_pos = t1.zeros((), dtype=t1.int32)
+
+            for i in range(0, NUM_TILES):
+                offs_n = i * BLOCK_SIZE + t1.arange(0, BLOCK_SIZE)
+                mask_n = offs_n < seq_len
+                vals = t1.load(ACC_ROW + offs_n, mask=mask_n, other=-float("inf"))
+                keep_mask = (vals > pivot) & mask_n
+
+                if num_keep < num_min_larger:
+                    dup_mask = (t1.abs(vals - min_larger) < 1e-9) & mask_n
+                    dup_cumsum = t1.cumsum(dup_mask.to(t1.int32)) + num_kept
+                    dup_keep = (dup_cumsum <= num_keep) & dup_mask
+                    dup_remove = dup_mask & (~dup_keep)
+                    num_kept += t1.sum(dup_keep.to(t1.int32))
+                    keep_mask = keep_mask & (~dup_remove)
+
+                page_id = offs_n // page_size
+                offset_in_page = offs_n % page_size
+                physical_page = t1.load(
+                    BLOCK_TABLE + row_id * max_num_pages + page_id,
+                    mask=keep_mask, other=0,
+                )
+                physical_addr = physical_page * page_size + offset_in_page
+
+                cumulative_pos = t1.cumsum(keep_mask.to(t1.int32)) - 1 + write_pos
+                out_ptrs = TOPK_INDICES + row_id * K + cumulative_pos
+                t1.store(out_ptrs, physical_addr.to(t1.int32), mask=keep_mask)
+                write_pos += t1.sum(keep_mask.to(t1.int32))
+
+
+def compute_topk_qrita(acc, seq_offsets, seq_lens, block_table, page_size, max_num_pages,
+                        batch_size, topk=2048, BLOCK_SIZE=1024):
+    """
+    Qrita-inspired pivot-search top-k, as an alternative to the existing
+    sequential replace-the-minimum topk_kernel. See module comment above
+    topk_kernel_qrita for design notes and adaptations from the original.
+
+    Like topk_kernel, output indices are PHYSICAL page addresses
+    (page_idx * page_size + offset_in_page), not local sequence-relative
+    offsets -- converted via block_table, matching topk_kernel's Finding 5
+    fix so outputs from both kernels are directly comparable.
+    """
+    device = acc.device
+    topk_indices = torch.full((batch_size, topk), -1, dtype=torch.int32, device=device)
+
+    num_sm = torch.cuda.get_device_properties(device).multi_processor_count
+    num_programs = min(num_sm, batch_size)
+
+    topk_kernel_qrita[(num_programs,)](
+        acc, seq_offsets, seq_lens, block_table, topk_indices, batch_size,
+        K=topk, BLOCK_SIZE=BLOCK_SIZE, page_size=page_size, max_num_pages=max_num_pages,
+    )
+    return topk_indices
