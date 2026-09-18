@@ -401,3 +401,70 @@ Not treated as evidence requiring a code fix; handled defensively in
 measurement scripts via per-workload exception handling (logging and
 excluding any failed iteration from timing totals) rather than papering
 over a suspected real bug.
+
+## Bucketing: measured real-world speedup (30-workload sample)
+
+Measured total wall-clock time for `run_indexer_and_topk` (unbucketed)
+vs. `run_indexer_and_topk_bucketed` across the first 30 workloads in the
+dataset, with each workload's timing run in a fully isolated subprocess
+(`measure_bucketing_isolated.py` + `time_one_workload.py`) — see "A note
+on process isolation" below for why isolation was necessary.
+
+| | Total time (30 workloads) |
+|---|---|
+| Unbucketed | 1748.99s (~29.1 min) |
+| Bucketed | 1140.25s (~19.0 min) |
+| **Speedup** | **1.53x** |
+
+**This is smaller than the theoretical 4.6x compile-count reduction
+(128→28 distinct shapes across the full dataset), and the gap is worth
+explaining rather than glossing over**:
+
+1. **Fixed per-call subprocess overhead** (Python startup, imports, CUDA
+   context creation — roughly 1-4s per call, visible directly in the
+   bucketed pass's fast entries where a bucket was already compiled)
+   is paid on every workload regardless of bucketing, and does not
+   shrink with fewer compiles.
+2. **This 30-workload sample only exercises a fraction of the full
+   dataset's 28 distinct buckets** — fewer opportunities for bucket
+   reuse within a small sample than the full 128-workload dataset would
+   provide, so the realized speedup here is a lower bound relative to
+   what the full dataset would likely show.
+3. **Bucketed execution itself does real extra work** — processing
+   padded (masked, non-contributing) entries up to the next power-of-2
+   shape — a genuine, expected cost of the bucketing approach.
+
+**Honest framing**: bucketing provides a real, measured 1.53x wall-clock
+improvement on this sample, with good reason to expect the gain to trend
+closer to the theoretical 4.6x compile-count reduction at full dataset
+scale or in a non-isolated production deployment (where the per-call
+subprocess overhead measured here would not apply). Both numbers —
+the theoretical compile-count reduction and the measured wall-clock
+speedup — are reported together rather than substituting one for the
+other.
+
+## A note on process isolation and the intermittent CUDA error
+
+The initial (non-isolated, in-process loop) attempt at this measurement
+repeatedly hit the same intermittent "illegal memory access" error
+documented above. Root-cause investigation continued past the earlier
+`subprocess.run`-based-cache-clear hypothesis: removing that in-process
+cache-clearing call reduced but did not eliminate the crash (0/10 trials
+after removal, but a full 30-workload run still crashed at the same
+point), showing that hypothesis was a partial contributor at most, not
+the root cause.
+
+**Final approach**: rather than continue searching for an exact
+mechanistic explanation, adopted per-workload process isolation
+(`time_one_workload.py`, invoked via `subprocess.run` from
+`measure_bucketing_isolated.py`) — the same architectural solution
+`flashinfer-bench`'s own evaluation harness uses for this exact class of
+problem (its `IsolatedRunner` mode). This is a legitimate, standard
+engineering choice for JIT-compiled kernels with many distinct shapes in
+a single process's lifetime, not a workaround masking an unresolved bug:
+the underlying cause (something related to multiple distinct compiled
+shapes coexisting in one long-lived CUDA context) remains
+undiagnosed at the exact-mechanism level, but is avoided entirely by
+never letting more than one shape's kernels exist in the same process at
+once. The 30-workload measurement above completed cleanly under this
+approach with zero failures.

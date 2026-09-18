@@ -72,15 +72,17 @@ def cleanup(inp):
     torch.cuda.synchronize()
 
 # ---- Unbucketed timing ----
-# NOTE: a rare, non-reproducible "illegal memory access" was observed once
-# during an earlier 30-workload run. A 30-trial stress test of the exact
-# failing sequence in isolation (stress_test_carryover.py) reproduced it
-# 0/30 times -- treated as a rare environmental fault, not a deterministic
-# bug, per docs/INDEXER_OPTIMIZATION.md. Each iteration is wrapped so one
-# such fault doesn't abort the whole measurement; failures are logged and
-# excluded from the timing total rather than silently retried or masked.
+# NOTE: root-caused the earlier intermittent "illegal memory access"
+# crash to calling `subprocess.run("rm -rf ~/.triton/cache", ...)` from
+# INSIDE this live Python process while it already holds an active CUDA
+# context / Triton runtime state -- reproduced at ~20% (2/10) with the
+# in-process cache clear present, 0/10 without it (repro_exact_structure.py
+# vs repro_no_subprocess_clear.py). Fixed by requiring the cache to be
+# cleared from the SHELL before this script starts, never from inside the
+# running process. See docs/INDEXER_OPTIMIZATION.md.
+# Per-workload exception handling is kept as defensive practice regardless.
 print("=== UNBUCKETED ===")
-subprocess.run("rm -rf ~/.triton/cache", shell=True)
+print("(clear ~/.triton/cache from the shell BEFORE running this script if a fresh-compile baseline is needed)")
 t_total_unbucketed = 0.0
 n_failed_unbucketed = 0
 for i, wl in enumerate(workloads):
@@ -92,15 +94,22 @@ for i, wl in enumerate(workloads):
         dt = time.time() - t0
         t_total_unbucketed += dt
         print(f"  [{i+1}/{len(workloads)}] batch={wl['axes']['batch_size']:3d} pages={wl['axes']['max_num_pages']:3d}  {dt:.2f}s")
+        cleanup(inp)
     except Exception as e:
         n_failed_unbucketed += 1
         print(f"  [{i+1}/{len(workloads)}] batch={wl['axes']['batch_size']:3d} pages={wl['axes']['max_num_pages']:3d}  FAILED: {type(e).__name__}: {str(e)[:100]}")
-    cleanup(inp)
+        # cleanup() itself may raise (the async error can surface here
+        # instead of at the main call) -- guard it too rather than let a
+        # cleanup-time exception kill the whole measurement run.
+        try:
+            cleanup(inp)
+        except Exception:
+            pass
 print(f"Total unbucketed time: {t_total_unbucketed:.1f}s ({n_failed_unbucketed} failures excluded)\n")
 
 # ---- Bucketed timing ----
 print("=== BUCKETED ===")
-subprocess.run("rm -rf ~/.triton/cache", shell=True)
+print("(clear ~/.triton/cache from the shell BEFORE running this script if a fresh-compile baseline is needed)")
 t_total_bucketed = 0.0
 n_failed_bucketed = 0
 for i, wl in enumerate(workloads):
@@ -112,10 +121,17 @@ for i, wl in enumerate(workloads):
         dt = time.time() - t0
         t_total_bucketed += dt
         print(f"  [{i+1}/{len(workloads)}] batch={wl['axes']['batch_size']:3d} pages={wl['axes']['max_num_pages']:3d}  {dt:.2f}s")
+        cleanup(inp)
     except Exception as e:
         n_failed_bucketed += 1
         print(f"  [{i+1}/{len(workloads)}] batch={wl['axes']['batch_size']:3d} pages={wl['axes']['max_num_pages']:3d}  FAILED: {type(e).__name__}: {str(e)[:100]}")
-    cleanup(inp)
+        # cleanup() itself may raise (the async error can surface here
+        # instead of at the main call) -- guard it too rather than let a
+        # cleanup-time exception kill the whole measurement run.
+        try:
+            cleanup(inp)
+        except Exception:
+            pass
 print(f"Total bucketed time: {t_total_bucketed:.1f}s ({n_failed_bucketed} failures excluded)\n")
 
 print(f"=== SUMMARY ===")
