@@ -822,9 +822,63 @@ def topk_kernel_qrita(
                     num_min_larger = nml_0
                     found = 1
 
-            # num_keep: how many of the "duplicate" (tied-at-min_larger)
-            # values to actually keep, to hit exactly K total.
-            num_keep = num_min_larger - (k_count - K)
+            # BUG FIX (verified by hand against instrumented debug output,
+            # not guessed): min_larger/num_min_larger/k_count from the
+            # ternary loop are only trustworthy when they came from the
+            # SAME accepted branch (cnt_0/cnt_1 satisfying the termination
+            # condition). When the loop instead exits via the fallback
+            # (num_iters>=30 or range-collapse), pivot is freshly computed
+            # as a midpoint, but min_larger/num_min_larger/k_count are
+            # stale leftovers from the previous iteration's REJECTED probe
+            # -- inconsistent with the actual final pivot. Always recompute
+            # fresh, relative to the actual final pivot, via one more scan
+            # (using the same _update_min_larger_stats helper already used
+            # in the ternary loop above) -- correct regardless of which
+            # branch produced pivot, and a strict superset of the original
+            # (already-correct) trim logic for the normal case.
+            cnt_above_final = t1.zeros((), dtype=t1.int32)
+            cnt_equal_final = t1.zeros((), dtype=t1.int32)
+            min_larger_final = float("inf")
+            num_min_larger_final = t1.zeros((), dtype=t1.int32)
+            for i in range(0, NUM_TILES):
+                offs_n = i * BLOCK_SIZE + t1.arange(0, BLOCK_SIZE)
+                mask_n = offs_n < seq_len
+                vals = t1.load(ACC_ROW + offs_n, mask=mask_n, other=-float("inf"))
+                above_final = (vals > pivot) & mask_n
+                cnt_above_final += t1.sum(above_final.to(t1.int32))
+                cnt_equal_final += t1.sum(((t1.abs(vals - pivot) < 1e-9) & mask_n).to(t1.int32))
+                min_larger_final, num_min_larger_final = _update_min_larger_stats(
+                    vals, above_final, min_larger_final, num_min_larger_final, float("inf")
+                )
+
+            # Two exhaustive, mutually-exclusive cases based on where the
+            # true K-th-largest value sits relative to pivot:
+            #   cnt_above_final >= K: true boundary is a value STRICTLY
+            #     ABOVE pivot (the tied-at-min_larger_final group) -- trim
+            #     the excess from that group. [This is the original,
+            #     already-correct logic for the normal ternary-search
+            #     accept case -- unaffected by this fix.]
+            #   cnt_above_final < K: true boundary IS pivot itself (or the
+            #     search landed on a real, common data value) -- add ties
+            #     AT pivot (cnt_equal_final group) to make up the shortfall.
+            #     [This is the previously-missing case: Finding 6 testing
+            #     never exercised heavy ties, so this path was never hit.]
+            use_trim_path = cnt_above_final >= K
+            num_keep = t1.where(use_trim_path, num_min_larger_final - (cnt_above_final - K), 0)
+            num_keep_equal = t1.where(use_trim_path, 0, t1.maximum(t1.minimum(K - cnt_above_final, cnt_equal_final), 0))
+            min_larger = min_larger_final
+            # BUG FIX: num_min_larger must be zeroed in the add-case
+            # (use_trim_path=False), otherwise the OLD trim block below
+            # ("if num_keep < num_min_larger") spuriously fires even when
+            # not in the trim case -- since num_keep=0 there and
+            # num_min_larger_final is generically nonzero (something is
+            # always the smallest value strictly above pivot), the trim
+            # block's dup_keep = (dup_cumsum <= 0) silently REMOVES the
+            # entire min_larger-tied group from the already-correct
+            # "> pivot" selection, undercounting even cnt_above_final's
+            # legitimately-selected values. Found via per-tile device_print
+            # tracing showing keep_mask_sum totaling far below cnt_above_final.
+            num_min_larger = t1.where(use_trim_path, num_min_larger_final, 0)
             num_kept = t1.zeros((), dtype=t1.int32)
             write_pos = t1.zeros((), dtype=t1.int32)
 
@@ -841,6 +895,13 @@ def topk_kernel_qrita(
                     dup_remove = dup_mask & (~dup_keep)
                     num_kept += t1.sum(dup_keep.to(t1.int32))
                     keep_mask = keep_mask & (~dup_remove)
+
+                if num_keep_equal > 0:
+                    eq_mask = (t1.abs(vals - pivot) < 1e-9) & mask_n
+                    eq_cumsum = t1.cumsum(eq_mask.to(t1.int32)) + num_kept
+                    eq_keep = (eq_cumsum <= num_keep_equal) & eq_mask
+                    num_kept += t1.sum(eq_keep.to(t1.int32))
+                    keep_mask = keep_mask | eq_keep
 
                 page_id = offs_n // page_size
                 offset_in_page = offs_n % page_size

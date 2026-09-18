@@ -723,3 +723,152 @@ latency; it is not a fix for in-process multi-shape reliability, and
 that limitation should be stated plainly in the paper rather than
 implicitly papered over by the fact that all reported measurements use
 isolated processes.
+
+## Finding 8 (fixed): topk_kernel_qrita undercounts under heavy value ties
+
+Motivated by a documented gap in Finding 7 ("not yet tested: tie-heavy
+input distributions... the general path's duplicate-value resolution
+logic is largely unexercised by these workloads"). Built
+`correctness_test_qrita_ties.py` with deliberately tie-heavy synthetic
+data (small-integer-range scores, forced boundary clusters, and a fully
+degenerate all-identical case) to close this gap.
+
+**Initial result: 3 of 5 tie-heavy test cases failed**, including the
+most extreme case (every value in the sequence identical, "Test E"),
+where `topk_kernel_qrita` returned **zero** selected indices instead of
+K, and a real-dataset-scale heavy-tie case ("Test C") where it
+undercounted by ~30% (1441/2048 selected, in one investigation pass).
+
+**Why set-equality wasn't the right correctness bar here**: under
+genuine value ties, multiple index sets can be equally valid (if five
+values tie for the K-th slot and one slot remains, any one of the five
+is correct). `correctness_test_qrita_ties.py` therefore checks, per
+batch: (1) exact expected count (`min(K, seq_len)`), (2) every selected
+value is at or above the true K-th-largest value, and (3) no unselected
+value strictly exceeds the minimum selected value — the real
+correctness bar under ties, distinct from (and weaker than, but not
+laxer in any way that would hide a bug) the set-equality check Finding
+6 used, since Finding 6's data had negligible exact ties and set
+equality was appropriate there.
+
+**This finding took three complete fix attempts to resolve correctly**,
+each verified against ground truth via direct in-kernel
+`t1.device_print` instrumentation, not reconstructed standalone Python
+scripts — an earlier reconstruction attempt was itself found to contain
+two independent bugs (a dropped termination-condition clause when
+copying the ternary search's exit logic by hand, and a test-harness
+RNG-state mismatch: `torch.manual_seed(0)` is called once at file scope
+in `correctness_test_qrita_ties.py`, so Tests A-E draw sequentially from
+one continuously-advancing RNG stream; a standalone debug script that
+reseeded fresh before generating "Test C's data" silently diagnosed
+different data than what the real suite actually fed the kernel).
+Documenting the false starts plainly, not just the final fix, because
+the underlying bug class recurred at each attempt:
+
+1. **First attempt**: unconditionally replaced the trim-based tie
+   resolution with an add-based one. Fixed the degenerate case but
+   *regressed* previously-correct behavior on moderate-tie cases (Tests
+   A/B), because the original trim logic was never actually broken for
+   the normal case — replacing it wholesale traded two real bugs for
+   three new ones.
+2. **Second attempt**: branched on `cnt_above_final >= K` to choose
+   trim vs. add, but miscategorized a normal (non-degenerate) heavy-tie
+   case as degenerate, because the trim path's `min_larger`/
+   `num_min_larger` were computed relative to the wrong pivot (the last
+   *rejected* ternary probe point from the second-to-last iteration, not
+   the actual accepted/converged final pivot) — a real, pre-existing bug
+   in the ternary search's bookkeeping, present since this function was
+   first written, just never exercised by the low-tie-density data used
+   in Finding 6/7's testing.
+3. **Third, correct fix**: after settling on `pivot` (via whichever
+   loop-exit path — normal termination or the range-collapse/iteration-cap
+   fallback), always freshly recompute `cnt_above_final`, `cnt_equal_final`,
+   and `min_larger_final`/`num_min_larger_final` relative to the *actual
+   final pivot*, via one additional scan using the existing
+   `_update_min_larger_stats` helper (the same one already used inside
+   the ternary loop, not reimplemented). Branch on `cnt_above_final >= K`:
+   trim excess ties strictly above pivot in the normal case, or add ties
+   exactly at pivot in the shortfall case. Verified by hand against
+   `t1.device_print` output (pivot=0.0, cnt_above_final=1907,
+   cnt_equal_final=593, matching independently-computed ground truth
+   exactly) before writing the fix, not after.
+
+**A fourth, more subtle bug was found even within this correct branch
+split**: `num_min_larger` must be explicitly zeroed when the add-case is
+active (`use_trim_path=False`). Left unzeroed, the *original* trim
+block's condition (`if num_keep < num_min_larger:`) spuriously fires
+even when not in the trim case — since `num_keep=0` there while
+`num_min_larger_final` is generically nonzero (something is always the
+smallest value strictly above pivot, even when it isn't the group that
+needs adjusting) — silently deleting the entire `min_larger`-tied group
+from the already-correct "value > pivot" selection. This was the actual
+mechanism behind the ~30% undercount, found only by adding per-tile
+`t1.device_print` tracing of `write_pos`/`keep_mask_sum` across all
+`NUM_TILES` iterations and observing the running total plateau well
+below `cnt_above_final` before the tie-resolution logic even engaged.
+
+**Verification — tie-heavy synthetic tests**: all 5 cases pass after the
+fix, alongside a clean re-run of Finding 6's original 4-case suite
+(13/13 batches, unaffected by this change):
+
+| Test | Description | Result |
+|---|---|---|
+| A | Moderate ties (values 0-20), K=64 | PASS (3/3 batches) |
+| B | Heavy ties (values 0-4), K=64 | PASS (3/3 batches) |
+| C | Heavy ties at real production scale, K=2048 | PASS (2/2 batches) |
+| D | Forced boundary-cluster ties, K=16 | PASS (2/2 batches) |
+| E | Fully degenerate (every value identical), K=64 | PASS (3/3 batches) |
+
+**Retroactive verification against Finding 7's real dataset workloads**:
+re-ran all 7 real-dataset workloads (real FP8-derived `acc` scores, not
+synthetic) via `time_one_qrita_workload.py`'s per-workload process
+isolation (see "known limitation" note below for why isolation was
+necessary here too). Results are unchanged from Finding 7's original
+table within measurement noise — confirming real acc score distributions
+(continuous FP8-derived dot products, negligible exact ties) never
+triggered this bug, and Finding 7's correctness and performance numbers
+stand exactly as originally reported:
+
+| UUID | batch | max_seq_len | overlap/existing | existing | qrita | speedup |
+|---|---|---|---|---|---|---|
+| 30cecff1 | 1 | 2 | 2/2 | 0.0195ms | 0.0242ms | 0.8x |
+| 44ddaa65 | 1 | 129 | 129/129 | 0.0639ms | 0.0216ms | 3.0x |
+| b2098949 | 2 | 92 | 140/140 | 0.0420ms | 0.0214ms | 2.0x |
+| 83cb81c5 | 3 | 73 | 160/160 | 0.0366ms | 0.0212ms | 1.7x |
+| 4279d75e | 4 | 1037 | 1194/1194 | 0.3740ms | 0.0212ms | 17.6x |
+| 70d53807 | 12 | 5194 | 2611/2611 | 2.0426ms | 0.0597ms | 34.2x |
+| 1ece7fb3 | 15 | 1089 | 1831/1831 | 0.4016ms | 0.0209ms | 19.2x |
+
+**Known limitation recurred during this investigation, worth naming
+explicitly**: the in-process reliability gap documented in Finding 7
+("Open item: in-process multi-shape reliability") reproduced again here,
+independent of the tie-fix itself. A combined correctness+performance
+sweep across all 7 workloads in one process
+(`sweep_qrita_correctness_and_perf.py`) ran the first 4 workloads cleanly
+then crashed with the same `illegal memory access` signature on the 5th
+(pointing at an unrelated, independently-correct line — the same
+context-poisoning pattern documented previously), consistent across two
+separate runs of that script on two different occasions in this
+project's history. **Current bypass, not a fix**: per-workload process
+isolation (`time_one_qrita_workload.py`, one fresh CUDA context per
+workload) sidesteps the issue and produced the clean 7/7 results above
+and in Finding 7 — this is the same standard methodology
+(`flashinfer-bench`'s own `IsolatedRunner` pattern) used throughout this
+project for exactly this class of problem, not a workaround invented to
+dodge an inconvenient bug. The underlying root cause remains
+undiagnosed at the exact-mechanism level (as in Finding 7's original
+investigation) and is orthogonal to Finding 8's tie-handling bug — fixing
+the tie-handling logic did not, and was never expected to, resolve the
+separate in-process multi-shape reliability question. Both facts should
+be stated together in the paper: per-call latency measurements are
+sound (via isolation), but continuous multi-shape serving within one
+process remains an open reliability question for this kernel family.
+
+**Status**: Finding 8's tie-handling bug is fixed and verified. This bug
+class (ternary-search convergence-state staleness across different
+loop-exit paths) is worth keeping in mind for any future modification to
+this kernel's pivot search — the lesson is that bookkeeping variables
+computed inside a loop are only as trustworthy as the specific branch
+that produced them, and must be re-derived from the final converged
+state before being relied on downstream, rather than assumed consistent
+across every path that could have set them.
