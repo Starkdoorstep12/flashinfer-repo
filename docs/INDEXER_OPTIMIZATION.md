@@ -624,3 +624,102 @@ stress test (`stress_test_indexer_dataset.py`-style, real dataset
 workloads) before treating this as fully generalized, given how much
 the bug was masked by batch-0-always-passing in the initial hand-picked
 test cases.
+
+## Finding 7: topk_kernel_qrita performance vs topk_kernel — scales with seq_len, not a flat speedup
+
+Following Finding 6's correctness fix, measured `topk_kernel_qrita` vs
+`topk_kernel` performance on the same 7 real dataset workloads used to
+validate Findings 1/4/5/6 (`sweep_qrita_correctness_and_perf.py` /
+`time_one_qrita_workload.py`), using real `acc` scores produced by the
+golden-verified `indexer_kernel` (not synthetic random scores), with
+warm-cache timing (5 warmup + 20 timed iterations, CUDA events, matching
+`baseline_indexer_timing.py`'s methodology).
+
+**Correctness**: 7/7 workloads passed with exact overlap between
+`topk_kernel` and `topk_kernel_qrita` (batch sizes 1, 1, 2, 3, 4, 12,
+15 — including the same non-power-of-2 values that validated Finding 1),
+confirming Finding 6's fix generalizes to real acc score distributions,
+not just the synthetic ones used in `correctness_test_qrita.py`.
+
+| UUID | batch | max_seq_len | overlap/existing | existing | qrita | speedup |
+|---|---|---|---|---|---|---|
+| 30cecff1 | 1 | 2 | 2/2 | 0.0203ms | 0.0212ms | 0.96x |
+| 44ddaa65 | 1 | 129 | 129/129 | 0.0643ms | 0.0216ms | 3.0x |
+| b2098949 | 2 | 92 | 140/140 | 0.0420ms | 0.0232ms | 1.8x |
+| 83cb81c5 | 3 | 73 | 160/160 | 0.0359ms | 0.0212ms | 1.7x |
+| 4279d75e | 4 | 1037 | 1194/1194 | 0.3739ms | 0.0214ms | 17.5x |
+| 70d53807 | 12 | 5194 | 2611/2611 | 2.0421ms | 0.0469ms | 43.5x |
+| 1ece7fb3 | 15 | 1089 | 1831/1831 | 0.4008ms | 0.0213ms | 18.8x |
+
+**Framing this finding correctly (as with Findings 2/3)**: the headline is
+not "Qrita is Nx faster" — speedup is not constant, and reporting only the
+best number (43.5x) without qualification would misrepresent the result.
+Sorting by `max_seq_len` rather than UUID makes the real pattern clear:
+speedup climbs monotonically with `max_seq_len` (0.96x at seq_len=2, up to
+43.5x at seq_len=5194), essentially independent of `batch_size` — compare
+`batch=4, seq_len=1037` (17.5x) against `batch=15, seq_len=1089` (18.8x):
+nearly identical seq_len, nearly identical speedup, despite batch_size
+differing by nearly 4x. This is consistent with the underlying complexity
+difference: `topk_kernel`'s replace-the-minimum scan is O(seq_len × K)
+and its measured latency scales roughly linearly with `max_seq_len`
+(0.02ms → 2.04ms across the range tested), while `topk_kernel_qrita`'s
+ternary pivot search stays nearly flat (0.021–0.047ms) — its slight
+uptick at the largest seq_len tested is consistent with `NUM_TILES`
+growing, at a far shallower slope than the existing kernel's per-token
+scan.
+
+**At small/trivial seq_len (≤~100), the two kernels are roughly
+comparable, and at the smallest case tested (seq_len=2, fast path)
+qrita is marginally *slower*** (0.96x) — plausibly ternary-search
+setup/loop overhead against a case `topk_kernel`'s replace-the-minimum
+scan handles with almost no work either way. This matches the same
+`seq_len ≤ topk` degenerate-case territory TensorRT-LLM's team singled
+out for a dedicated fast-path bypass (see the crash investigation
+above) — worth keeping in mind if a fast-path specialization is ever
+added to `topk_kernel_qrita` itself.
+
+**Status**: `topk_kernel_qrita` is verified correct and characterized as
+a real SOTA baseline for the paper, with an honest, seq_len-dependent
+performance profile rather than a single flat number. Not yet tested:
+tie-heavy input distributions (the real `acc` scores used here, while
+not synthetic random noise, still come from continuous FP8-derived
+dot products with few exact ties; the general path's duplicate-value
+resolution logic, `dup_mask`/`dup_cumsum`, is more expensive and largely
+unexercised by these workloads) — worth checking whether the speedup
+profile holds under more tie-heavy conditions before treating it as
+fully general.
+
+### Open item: in-process multi-shape reliability is a real limitation, not just a benchmarking inconvenience
+
+While building this sweep, an initial in-process version (looping over
+all 7 workloads directly, without per-workload process isolation) hit
+the same intermittent `CUDA error: an illegal memory access was
+encountered` already documented above in the "Deep investigation of the
+intermittent crash" section — this time triggered partway through the
+sweep (after 4 successful workloads, on the 5th), with the corrupted
+CUDA context manifesting as a crash on a completely unrelated,
+independently-correct line (`tensors['seq_lens'].to(device)`), the same
+context-poisoning signature observed before.
+
+Switching to per-workload process isolation
+(`time_one_qrita_workload.py`, one fresh CUDA context per workload,
+architecturally identical to `measure_bucketing_isolated.py`) resolved
+this and produced the clean 7/7 results above. This is a legitimate,
+standard measurement methodology — not a workaround invented to dodge
+an inconvenient bug — and it is the correct way to answer "what is this
+kernel's per-call latency."
+
+**However, it is important not to conflate that with a separate,
+still-open question: whether `topk_kernel` and `topk_kernel_qrita` are
+safe to call repeatedly, with multiple distinct compiled shapes, within
+a single long-lived process** — the realistic deployment scenario for
+an actual inference server, as opposed to an isolated benchmarking
+harness. That question remains genuinely unresolved; the root cause of
+the intermittent context corruption (previously narrowed to a real WAR
+shared-memory hazard via `compute-sanitizer --racecheck`, but not fully
+mechanistically explained — see above) has not changed as a result of
+this session's work. Process isolation is the right tool for measuring
+latency; it is not a fix for in-process multi-shape reliability, and
+that limitation should be stated plainly in the paper rather than
+implicitly papered over by the fact that all reported measurements use
+isolated processes.
