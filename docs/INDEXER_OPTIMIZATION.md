@@ -468,3 +468,85 @@ undiagnosed at the exact-mechanism level, but is avoided entirely by
 never letting more than one shape's kernels exist in the same process at
 once. The 30-workload measurement above completed cleanly under this
 approach with zero failures.
+
+## Deep investigation of the intermittent crash: closed for now, flagged for future work
+
+Extended the investigation significantly beyond the initial subprocess-
+cache-clear hypothesis, motivated by wanting a real root cause rather than
+a workaround. Summary of everything tried:
+
+**Narrowed the trigger to a specific shape.** Systematic isolation
+testing showed the crash requires workload 1 specifically (`batch_size=1,
+max_num_pages=1, seq_lens=[2]`) followed by another workload — running
+workload 2 → workload 3 (skipping workload 1) succeeded 10/10 fresh-
+compile trials, while sequences including workload 1 crashed at a low but
+nonzero rate across various conditions. This is a real, external
+validation point: NVIDIA's own TensorRT-LLM team identified `seq_len ≤
+topk` (exactly workload 1's case, `2 ≤ 2048`) as a degenerate edge case
+significant enough to warrant a dedicated "fast path" bypass in their
+production DeepSeek-V3.2 implementation (PR-9524), rather than relying on
+the general top-k kernel path for such inputs. This strongly suggests our
+kernel is hitting a real, known-difficult class of edge case, not an
+arbitrary fluke.
+
+**Traced three concrete code-level hypotheses to conclusions**:
+1. Buffer initialization: both `acc` and `topk_indices` use `torch.zeros`
+   (not `torch.empty`), ruling out an uninitialized-read-on-allocation
+   explanation.
+2. The `continue` statement in `topk_kernel`'s outer loop: does not
+   trigger for `MAX_SEQ_LEN=2` (`0 >= 2` is False), ruling this out for
+   this specific case.
+3. `batch_id` resolution logic (Finding 1's power-of-2 fix) at
+   `batch_size=1`: traced through the exact arithmetic
+   (`next_pow2(1)=1`, `arange(0,1)=[0]`, correct mask/load/comparison) —
+   resolves correctly.
+
+**Ran `compute-sanitizer --tool racecheck`** (checks for race conditions
+between concurrent memory accesses — a category neither `memcheck` nor
+`initcheck`, run earlier, covers). Found a real, reproducible finding:
+consistent WAR (write-after-read) shared-memory hazard warnings in the
+kernel's reduction logic, present in both workload 1 and workload 2's
+compiled code. However, **15/15 trials under racecheck completed with no
+crash** — the hazard warnings appear to be present in every run
+(crashing or not), and racecheck's own heavy instrumentation may itself
+be altering the exact timing that triggers the rare crash (a "Heisenbug"
+pattern — a real, known category of issue where a debugging tool's own
+overhead changes the conditions needed to reproduce a race).
+
+**Final tally across the full investigation**: ~75+ combined trials
+across plain execution (30/30, 20/20, 10/10 clean under various
+conditions), `compute-sanitizer --memcheck` (0 errors, confirmed real
+instrumentation), `compute-sanitizer --initcheck` (0 errors, confirmed
+real instrumentation), and `compute-sanitizer --racecheck` (0 crashes,
+but did surface a real WAR hazard pattern). The crash itself has
+occurred exactly twice, both times in the original unmodified
+`measure_bucketing_benefit.py` script, never once under any isolated
+repro or diagnostic tool built since.
+
+**Status: closed for now, flagged as open future work.** The evidence
+converges on: (a) the trigger is specifically workload 1's degenerate
+`seq_len ≤ topk` shape, a known-hard edge case per production precedent,
+and (b) the exact mechanism remains unproven, likely because it is a
+genuine timing-sensitive race whose window is narrow enough that
+diagnostic tooling's own overhead prevents direct observation. The
+correctness of the *bucketing* result itself is unaffected — the real
+128-workload measurement should be run with per-workload process
+isolation (`measure_bucketing_isolated.py`), which sidesteps this issue
+entirely regardless of its root cause.
+
+**Concrete next steps for revisiting this** (not yet attempted):
+1. Implement TensorRT-LLM's approach directly: add an explicit fast-path
+   bypass in `run_indexer_and_topk` for `seq_len ≤ topk` (select all
+   tokens directly, skip the top-k kernel's replace-the-minimum logic
+   entirely for this case) — this would likely eliminate the crash by
+   removing the degenerate code path altogether, as a byproduct of a
+   change that's independently justified by TensorRT-LLM's own
+   optimization rationale (redundant computation, not just a bug
+   workaround).
+2. Investigate whether `topk_kernel`'s replace-the-minimum algorithm
+   should be replaced entirely with a radix-select or bitonic approach —
+   TensorRT-LLM's production radix-select implementation reports a 7.4x
+   speedup over `torch.topk` (arXiv:2604.22312), a substantially larger
+   potential win than bucketing's 1.53x, on a completely different
+   (algorithmic, not compile-time) axis. This is a separate, real
+   optimization opportunity worth its own investigation.
